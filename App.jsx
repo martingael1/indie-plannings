@@ -1660,13 +1660,13 @@ function EmployeeView({ resto, emp, onBack }) {
           <>
             {monPt.confirme ? (
               <div className="ig-status-line" style={{background:'#EAF3F3'}}>
-                <span className="ig-stamp" style={{borderColor:'var(--sea)'}}><Icon.Check width={15} height={15}/> Journée validée</span>
+                <span className="ig-stamp" style={{borderColor:'var(--sea)'}}><Icon.Check width={15} height={15}/> Présence validée</span>
                 <div className="ig-muted" style={{marginTop:8}}>À demain !</div>
               </div>
             ) : (
               <div className="ig-clock-actions">
                 <button className="ig-clock-btn" style={{background:'var(--sea)',color:'#fff',minWidth:240}} onClick={confirmerJour}>
-                  Valider ma journée
+                  Valider ma présence
                 </button>
               </div>
             )}
@@ -1687,7 +1687,7 @@ function EmployeeView({ resto, emp, onBack }) {
               const p = monPlanning[j];
               return (
                 <div key={j} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
-                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(lundi,j))} · {p.debut} – {p.fin}</span></div>
+                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(lundi,j))}</span></div>
                   <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPasse(j)}>Confirmer ce jour</button>
                 </div>
               );
@@ -1695,34 +1695,6 @@ function EmployeeView({ resto, emp, onBack }) {
           </div>
         </div>
       )}
-
-      {/* Mon planning du jour uniquement */}
-      <div className="ig-weekbar">
-        <span className="lbl" style={{textTransform:'capitalize'}}>Mon planning · {now.toLocaleDateString("fr-FR",{weekday:'long',day:'numeric',month:'long'})}</span>
-      </div>
-      <div className="ig-card" style={{padding:'18px 20px'}}>
-        {!planning ? (
-          <div className="ig-muted">Votre planning n'a pas encore été publié par votre manager pour aujourd'hui.</div>
-        ) : !planJour || planJour.statut===STATUTS.OFF ? (
-          <div style={{fontSize:16,fontWeight:600,color:'var(--ink-soft)'}}>Repos aujourd'hui (OFF)</div>
-        ) : planJour.statut===STATUTS.CP ? (
-          <div style={{fontSize:16,fontWeight:600,color:'#3A6EA5'}}>Congé payé (CP)</div>
-        ) : planJour.statut===STATUTS.AM ? (
-          <div style={{fontSize:16,fontWeight:600,color:'#C2702A'}}>Arrêt maladie (AM)</div>
-        ) : planJour.statut===STATUTS.SANS_SOLDE ? (
-          <div style={{fontSize:16,fontWeight:600,color:'#6B5B95'}}>Congé sans solde (CSS)</div>
-        ) : planJour.statut===STATUTS.DEMI_CP ? (
-          <div>
-            <div style={{fontSize:24,fontFamily:"'Inter',system-ui,sans-serif",fontWeight:600}}>{planJour.debut} – {planJour.fin}</div>
-            <div className="ig-muted" style={{marginTop:4}}>Demi-CP · {planJour.demi==="am"?"matin en congé":"après-midi en congé"} · {fmtHeures(dureeJour(planJour))} travaillées</div>
-          </div>
-        ) : (
-          <div>
-            <div style={{fontSize:24,fontFamily:"'Inter',system-ui,sans-serif",fontWeight:600}}>{planJour.debut} – {planJour.fin}{planJour.coupure && planJour.debut2 && planJour.fin2 ? `  ·  ${planJour.debut2} – ${planJour.fin2}` : ''}</div>
-            <div className="ig-muted" style={{marginTop:4}}>{planJour.coupure && planJour.debut2 && planJour.fin2 ? 'Service en coupure · ' : ''}{planJour.pause?`${planJour.pause}h de pause incluse · `:''}{fmtHeures(dureeJour(planJour))} de travail</div>
-          </div>
-        )}
-      </div>
 
       {/* Validation de la semaine (signature globale) */}
       {planning && joursTravailles.length > 0 && (
