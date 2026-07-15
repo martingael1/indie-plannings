@@ -1747,6 +1747,28 @@ function EmployeeView({ resto, emp, onBack }) {
         </div>
       </div>
 
+      {prec && prec.length > 0 && prec.map((w) => (
+        <div key={w.sem} className="ig-card" style={{padding:'16px 20px',marginBottom:18,border:'1.5px solid #E5A06A'}}>
+          <div style={{fontWeight:700,marginBottom:4,color:'#9A4A1B'}}>Semaine du {fmtDate(w.lundi)} au {fmtDate(ajouterJours(w.lundi,6))} — à valider</div>
+          <div className="ig-muted" style={{marginBottom:12}}>
+            Cette semaine passée n'a pas été entièrement confirmée/signée. Vous pouvez encore le faire depuis ici.
+          </div>
+          {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).length > 0 && (
+            <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
+              {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).map((j)=>(
+                <div key={j} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
+                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(w.lundi,j))}</span></div>
+                  <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPrecedent(w.sem, j)}>Confirmer ce jour</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <button className="ig-clock-btn" style={{background: w.tousConfirmes?'var(--coral)':'var(--sand-2)', color: w.tousConfirmes?'#fff':'var(--ink-soft)', minWidth:220, cursor: w.tousConfirmes?'pointer':'not-allowed'}} disabled={!w.tousConfirmes} onClick={()=>validerSemainePrecedente(w.sem)}>
+            Je valide cette semaine
+          </button>
+        </div>
+      ))}
+
       {valide === false ? (
         <div className="ig-card ig-clock-card" style={{marginBottom:22}}>
           <div className="ig-clock-date" style={{textTransform:'capitalize',fontSize:18,marginBottom:18}}>{now.toLocaleDateString("fr-FR",{weekday:'long',day:'numeric',month:'long'})}</div>
@@ -1786,28 +1808,6 @@ function EmployeeView({ resto, emp, onBack }) {
           <div className="ig-muted">Aucun service planifié aujourd'hui pour le moment.</div>
         )}
       </div>
-
-      {prec && prec.length > 0 && prec.map((w) => (
-        <div key={w.sem} className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
-          <div style={{fontWeight:700,marginBottom:4,color:'#9A4A1B'}}>Semaine du {fmtDate(w.lundi)} au {fmtDate(ajouterJours(w.lundi,6))} — à valider</div>
-          <div className="ig-muted" style={{marginBottom:12}}>
-            Cette semaine passée n'a pas été entièrement confirmée/signée. Vous pouvez encore le faire depuis ici.
-          </div>
-          {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).length > 0 && (
-            <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
-              {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).map((j)=>(
-                <div key={j} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
-                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(w.lundi,j))}</span></div>
-                  <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPrecedent(w.sem, j)}>Confirmer ce jour</button>
-                </div>
-              ))}
-            </div>
-          )}
-          <button className="ig-clock-btn" style={{background: w.tousConfirmes?'var(--coral)':'var(--sand-2)', color: w.tousConfirmes?'#fff':'var(--ink-soft)', minWidth:220, cursor: w.tousConfirmes?'pointer':'not-allowed'}} disabled={!w.tousConfirmes} onClick={()=>validerSemainePrecedente(w.sem)}>
-            Je valide cette semaine
-          </button>
-        </div>
-      ))}
 
       {joursARattraper.length > 0 && (
         <div className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
