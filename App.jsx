@@ -760,7 +760,7 @@ function EditModal({ jour, jourLabel, emp, p, onSave, onClose }) {
 }
 
 // ---------- Feuille d'émargement (format du modèle papier) ----------
-function EmargementSheet({ resto, semDate, planning, pointages, team }) {
+function EmargementSheet({ resto, semDate, planning, pointages, team, onToggleSignature }) {
   const lundi = lundiDeLaSemaine(semDate);
   const dimanche = ajouterJours(lundi, 6);
   const withPlanning = team.filter((e) => planning[idSalarie(e)]);
@@ -869,9 +869,23 @@ function EmargementSheet({ resto, semDate, planning, pointages, team }) {
                     {(() => {
                       const ptAll = pointages[idSalarie(e)];
                       const signee = ptAll && ptAll.semaine && ptAll.semaine.signee;
-                      return signee
-                        ? <div className="sig signed" style={{marginTop:6}}>✓ semaine validée</div>
-                        : <div className="sig" style={{marginTop:6}}>signature ____</div>;
+                      return (
+                        <>
+                          {signee
+                            ? <div className="sig signed" style={{marginTop:6}}>✓ semaine validée</div>
+                            : <div className="sig" style={{marginTop:6}}>signature ____</div>}
+                          {onToggleSignature && (
+                            <button
+                              className="ig-noprint ig-btn ig-btn-ghost ig-btn-sm"
+                              style={{marginTop:6,fontSize:11,padding:'2px 8px'}}
+                              onClick={() => onToggleSignature(e)}
+                              title={signee ? "Annuler la validation de cette semaine" : "Valider cette semaine à la place du salarié (ex : oubli, salarié parti avant dimanche)"}
+                            >
+                              {signee ? "Dévalider" : "Valider pour lui"}
+                            </button>
+                          )}
+                        </>
+                      );
                     })()}
                   </td>
                 </tr>
@@ -1180,6 +1194,19 @@ function ManagerView({ resto, onBack }) {
     setValide(false);
     Store.set(kValidation(resto, sem), false);
     montrerFlash("Planning repassé en préparation : les salariés ne le voient plus.");
+  }
+
+  // Validation manuelle de la semaine par le manager, à la place du salarié (ex : oubli
+  // avant dimanche minuit — le salarié ne peut alors plus valider lui-même sa semaine passée).
+  function toggleSignatureManuelle(emp) {
+    const id = idSalarie(emp);
+    const cur = pointages[id] || {};
+    const dejaSignee = !!(cur.semaine && cur.semaine.signee);
+    const nextSemaine = dejaSignee ? { signee: false } : { signee: true, parManager: true };
+    const next = { ...pointages, [id]: { ...cur, semaine: nextSemaine } };
+    setPointages(next);
+    Pointages.setSemaine(resto, sem, id, nextSemaine);
+    montrerFlash(dejaSignee ? "Validation annulée." : `Semaine validée pour ${emp.p} ${emp.n}.`);
   }
 
   function genererTout() {
@@ -1500,7 +1527,7 @@ function ManagerView({ resto, onBack }) {
       )}
 
       {vue === "emargement" && (
-        <EmargementSheet resto={resto} semDate={semDate} planning={planning} pointages={pointages} team={team} />
+        <EmargementSheet resto={resto} semDate={semDate} planning={planning} pointages={pointages} team={team} onToggleSignature={toggleSignatureManuelle} />
       )}
 
       {edit && (
