@@ -1081,6 +1081,7 @@ function ManagerView({ resto, onBack }) {
   const [modeSelect, setModeSelect] = useState(false); // mode nettoyage (sélection multiple)
   const [selection, setSelection] = useState(() => new Set()); // ids salariés cochés
   const [confirmLot, setConfirmLot] = useState(false); // confirmation du retrait en lot
+  const [confirmForceModele, setConfirmForceModele] = useState(false); // confirmation de l'écrasement forcé par le modèle
   const sem = cleSemaine(semDate);
 
   // Équipe effective : salariés du fichier + ajouts, moins ceux dont le contrat est terminé.
@@ -1303,6 +1304,22 @@ function ManagerView({ resto, onBack }) {
       ? `Modèle appliqué à ${ajoutes} salarié${ajoutes>1?'s':''} sans planning. Les plannings déjà saisis n'ont pas été touchés.`
       : "Tous les salariés avaient déjà un planning : rien n'a été modifié.");
   }
+  // Applique le modèle EN FORÇANT : écrase aussi les plannings déjà saisis cette semaine
+  // (utile quand "Appliquer le modèle" ne fait rien car la semaine n'est plus vierge).
+  function appliquerModeleForce() {
+    if (!modele) return;
+    const next = { ...planning };
+    let appliques = 0;
+    team.forEach((e) => {
+      const id = idSalarie(e);
+      if (modele[id]) {
+        next[id] = JSON.parse(JSON.stringify(modele[id]));
+        appliques++;
+      }
+    });
+    persistPlanning(next);
+    montrerFlash(`Modèle forcé sur ${appliques} salarié${appliques>1?'s':''} : tous les horaires de la semaine ont été remplacés par ceux du modèle.`);
+  }
   function saveCell(e, jour, data) {
     const id = idSalarie(e);
     const cur = planning[id] || {};
@@ -1449,6 +1466,7 @@ function ManagerView({ resto, onBack }) {
             <button className="ig-btn ig-btn-ghost" onClick={()=>{ setModeSelect((v)=>!v); setSelection(new Set()); setConfirmLot(false); }} style={modeSelect?{borderColor:'var(--coral-d)',color:'var(--coral-d)'}:undefined}>🧹 {modeSelect?"Terminer le nettoyage":"Nettoyer l'effectif"}</button>
             <button className="ig-btn ig-btn-ghost" onClick={enregistrerModele} disabled={Object.keys(planning).length===0} title="Mémoriser les horaires de cette semaine comme modèle">★ Enregistrer comme modèle</button>
             <button className="ig-btn ig-btn-ghost" onClick={appliquerModele} disabled={!modele} title="Reprendre les horaires du modèle pour les salariés sans planning">⤵ Appliquer le modèle</button>
+            <button className="ig-btn ig-btn-ghost" onClick={()=>setConfirmForceModele(true)} disabled={!modele} title="Écrase aussi les horaires déjà saisis cette semaine" style={{borderColor:'var(--coral-d)',color:'var(--coral-d)'}}>⚠ Forcer le modèle sur toute la semaine</button>
             <button className="ig-btn ig-btn-ink" onClick={imprimerPlanning} disabled={Object.keys(planning).length===0}><Icon.Print/> Télécharger le planning en PDF</button>
             {valide ? (
               <button className="ig-btn ig-btn-ghost" onClick={devaliderPlanning} style={{borderColor:'var(--sea)',color:'var(--sea)'}}><Icon.Check/> Planning validé — repasser en préparation</button>
@@ -1456,6 +1474,16 @@ function ManagerView({ resto, onBack }) {
               <button className="ig-btn ig-btn-primary" onClick={validerPlanning} disabled={Object.keys(planning).length===0} style={{background:'var(--sea)'}}><Icon.Check/> Valider le planning</button>
             )}
           </div>
+          {confirmForceModele && (
+            <div className="ig-noprint ig-card" style={{padding:'12px 16px',marginBottom:14,display:'flex',alignItems:'center',gap:12,flexWrap:'wrap',borderColor:'var(--coral-d)'}}>
+              <b style={{color:'var(--coral-d)'}}>Forcer le modèle sur toute la semaine ?</b>
+              <span className="ig-muted">Remplace les horaires déjà saisis cette semaine par ceux du modèle, pour tous les salariés présents dans le modèle. Les salariés déjà saisis manuellement seront écrasés.</span>
+              <div style={{marginLeft:'auto',display:'flex',gap:8}}>
+                <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>setConfirmForceModele(false)}>Annuler</button>
+                <button className="ig-btn ig-btn-sm" style={{background:'var(--coral-d)',color:'#fff'}} onClick={()=>{ appliquerModeleForce(); setConfirmForceModele(false); }}>Confirmer, tout remplacer</button>
+              </div>
+            </div>
+          )}
           {Object.keys(planning).length>0 && (
             <div className="ig-noprint" style={{marginBottom:14}}>
               <span className="ig-muted">Pour le PDF : une fenêtre d'impression s'ouvre, choisissez « Enregistrer au format PDF » comme destination. Glissez ensuite le fichier dans le dossier Drive du restaurant.</span>
