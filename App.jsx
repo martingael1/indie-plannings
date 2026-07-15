@@ -1574,6 +1574,7 @@ function EmployeeView({ resto, emp, onBack }) {
   const [pointages, setPointages] = useState({});
   const [valide, setValide] = useState(null); // null = en cours de chargement
   const [now, setNow] = useState(new Date());
+  const [prec, setPrec] = useState(null); // rattrapage semaine dernière (uniquement visible le lundi)
   const sem = cleSemaine(semDate);
   const id = idSalarie(emp);
 
@@ -1581,6 +1582,50 @@ function EmployeeView({ resto, emp, onBack }) {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  // Rattrapage du lundi : si la semaine dernière n'a pas été validée à temps (dimanche),
+  // on laisse encore une chance jusqu'au lundi soir avant que seul le manager puisse le faire.
+  useEffect(() => {
+    let on = true;
+    const jourReel = (new Date().getDay() + 6) % 7; // 0 = lundi
+    if (jourReel !== 0) { setPrec(null); return; }
+    const lundiActuel = lundiDeLaSemaine(new Date());
+    const lundiPrec = ajouterJours(lundiActuel, -7);
+    const semPrec = cleSemaine(lundiPrec);
+    Promise.all([Store.get(kPlanning(resto, semPrec)), Pointages.load(resto, semPrec)]).then(([pl, pt]) => {
+      if (!on) return;
+      const planningPrec = (pl && pl[id]) || null;
+      if (!planningPrec) { setPrec(null); return; }
+      const ptId = (pt && pt[id]) || {};
+      const joursTravailles = [];
+      for (let j = 0; j < 7; j++) if (planningPrec[j] && estJourTravaille(planningPrec[j].statut)) joursTravailles.push(j);
+      const signee = !!(ptId.semaine && ptId.semaine.signee);
+      if (joursTravailles.length === 0 || signee) { setPrec(null); return; }
+      const joursConfirmes = joursTravailles.filter((j) => ptId[j] && ptId[j].confirme);
+      const tousConfirmes = joursConfirmes.length === joursTravailles.length;
+      setPrec({ sem: semPrec, lundi: lundiPrec, planning: planningPrec, pointages: ptId, joursTravailles, tousConfirmes });
+    });
+    return () => { on = false; };
+  }, [resto, id, sem]);
+
+  function confirmerJourPrecedent(j) {
+    if (!prec) return;
+    const p = prec.planning[j];
+    if (!p || !estJourTravaille(p.statut)) return;
+    if (prec.pointages[j] && prec.pointages[j].confirme) return;
+    const nextJour = { confirme: "rattrapé", debut: p.debut, fin: p.fin, pause: p.pause || 0 };
+    const nextPt = { ...prec.pointages, [j]: nextJour };
+    const joursConfirmes = prec.joursTravailles.filter((jj) => nextPt[jj] && nextPt[jj].confirme);
+    const tousConfirmes = joursConfirmes.length === prec.joursTravailles.length;
+    setPrec({ ...prec, pointages: nextPt, tousConfirmes });
+    Pointages.setJour(resto, prec.sem, id, j, nextJour);
+  }
+
+  function validerSemainePrecedente() {
+    if (!prec || !prec.tousConfirmes) return;
+    Pointages.setSemaine(resto, prec.sem, id, { signee: true });
+    setPrec(null);
+  }
 
   useEffect(() => {
     let on = true;
@@ -1704,6 +1749,28 @@ function EmployeeView({ resto, emp, onBack }) {
           <div className="ig-muted">Aucun service planifié aujourd'hui pour le moment.</div>
         )}
       </div>
+
+      {prec && (
+        <div className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
+          <div style={{fontWeight:700,marginBottom:4,color:'#9A4A1B'}}>Semaine dernière — à valider avant ce soir</div>
+          <div className="ig-muted" style={{marginBottom:12}}>
+            Vous n'avez pas terminé la validation de la semaine du {fmtDate(prec.lundi)} au {fmtDate(ajouterJours(prec.lundi,6))}. Vous pouvez encore le faire aujourd'hui (lundi) ; passé ce délai, seul votre manager pourra la valider pour vous.
+          </div>
+          {prec.joursTravailles.filter((j)=>!(prec.pointages[j] && prec.pointages[j].confirme)).length > 0 && (
+            <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
+              {prec.joursTravailles.filter((j)=>!(prec.pointages[j] && prec.pointages[j].confirme)).map((j)=>(
+                <div key={j} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
+                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(prec.lundi,j))}</span></div>
+                  <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPrecedent(j)}>Confirmer ce jour</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <button className="ig-clock-btn" style={{background: prec.tousConfirmes?'var(--coral)':'var(--sand-2)', color: prec.tousConfirmes?'#fff':'var(--ink-soft)', minWidth:220, cursor: prec.tousConfirmes?'pointer':'not-allowed'}} disabled={!prec.tousConfirmes} onClick={validerSemainePrecedente}>
+            Je valide ma semaine dernière
+          </button>
+        </div>
+      )}
 
       {joursARattraper.length > 0 && (
         <div className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
