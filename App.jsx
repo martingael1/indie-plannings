@@ -760,7 +760,7 @@ function EditModal({ jour, jourLabel, emp, p, onSave, onClose }) {
 }
 
 // ---------- Feuille d'émargement (format du modèle papier) ----------
-function EmargementSheet({ resto, semDate, planning, pointages, team, onToggleSignature }) {
+function EmargementSheet({ resto, semDate, planning, pointages, team, onToggleSignature, onToggleJour }) {
   const lundi = lundiDeLaSemaine(semDate);
   const dimanche = ajouterJours(lundi, 6);
   const withPlanning = team.filter((e) => planning[idSalarie(e)]);
@@ -860,6 +860,16 @@ function EmargementSheet({ resto, semDate, planning, pointages, team, onToggleSi
                           <div className="sig signed">✓ confirmé</div>
                         ) : (
                           <div className="sig">signature ____</div>
+                        )}
+                        {onToggleJour && (
+                          <button
+                            className="ig-noprint ig-btn ig-btn-ghost ig-btn-sm"
+                            style={{marginTop:4,fontSize:10,padding:'1px 6px'}}
+                            onClick={() => onToggleJour(e, i, p)}
+                            title={pt && pt.confirme ? "Annuler la confirmation de ce jour" : "Confirmer ce jour à la place du salarié"}
+                          >
+                            {pt && pt.confirme ? "Annuler" : "Confirmer"}
+                          </button>
                         )}
                       </td>
                     );
@@ -1209,6 +1219,20 @@ function ManagerView({ resto, onBack }) {
     montrerFlash(dejaSignee ? "Validation annulée." : `Semaine validée pour ${emp.p} ${emp.n}.`);
   }
 
+  // Confirmation manuelle d'UN jour par le manager, à la place du salarié (ex : jour
+  // oublié sur une semaine déjà passée, que le salarié ne peut plus rattraper lui-même).
+  function toggleJourManuel(emp, j, planJour) {
+    const id = idSalarie(emp);
+    const cur = pointages[id] || {};
+    const dejaConfirme = !!(cur[j] && cur[j].confirme);
+    const nextJourData = dejaConfirme
+      ? { ...cur[j], confirme: null }
+      : { confirme: "manager", debut: planJour.debut, fin: planJour.fin, pause: planJour.pause || 0 };
+    const next = { ...pointages, [id]: { ...cur, [j]: nextJourData } };
+    setPointages(next);
+    Pointages.setJour(resto, sem, id, j, nextJourData);
+  }
+
   function genererTout() {
     const next = { ...planning };
     team.forEach((e) => {
@@ -1527,7 +1551,7 @@ function ManagerView({ resto, onBack }) {
       )}
 
       {vue === "emargement" && (
-        <EmargementSheet resto={resto} semDate={semDate} planning={planning} pointages={pointages} team={team} onToggleSignature={toggleSignatureManuelle} />
+        <EmargementSheet resto={resto} semDate={semDate} planning={planning} pointages={pointages} team={team} onToggleSignature={toggleSignatureManuelle} onToggleJour={toggleJourManuel} />
       )}
 
       {edit && (
@@ -1574,7 +1598,7 @@ function EmployeeView({ resto, emp, onBack }) {
   const [pointages, setPointages] = useState({});
   const [valide, setValide] = useState(null); // null = en cours de chargement
   const [now, setNow] = useState(new Date());
-  const [prec, setPrec] = useState(null); // rattrapage semaine dernière (uniquement visible le lundi)
+  const [prec, setPrec] = useState(null); // rattrapage : semaines passées incomplètes (liste)
   const sem = cleSemaine(semDate);
   const id = idSalarie(emp);
 
@@ -1583,48 +1607,61 @@ function EmployeeView({ resto, emp, onBack }) {
     return () => clearInterval(t);
   }, []);
 
-  // Rattrapage du lundi : si la semaine dernière n'a pas été validée à temps (dimanche),
-  // on laisse encore une chance jusqu'au lundi soir avant que seul le manager puisse le faire.
+  // Rattrapage : liste des semaines passées (hors semaine en cours) où le salarié n'a pas
+  // tout confirmé/signé à temps. Reste accessible depuis son espace à tout moment (pas
+  // seulement le lundi), sur une fenêtre limitée aux 8 dernières semaines.
+  const NB_SEMAINES_RATTRAPAGE = 8;
   useEffect(() => {
     let on = true;
-    const jourReel = (new Date().getDay() + 6) % 7; // 0 = lundi
-    if (jourReel !== 0) { setPrec(null); return; }
     const lundiActuel = lundiDeLaSemaine(new Date());
-    const lundiPrec = ajouterJours(lundiActuel, -7);
-    const semPrec = cleSemaine(lundiPrec);
-    Promise.all([Store.get(kPlanning(resto, semPrec)), Pointages.load(resto, semPrec)]).then(([pl, pt]) => {
+    const semainesAVerifier = Array.from({ length: NB_SEMAINES_RATTRAPAGE }, (_, k) => ajouterJours(lundiActuel, -7 * (k + 1)));
+    Promise.all(semainesAVerifier.map((lundiS) => {
+      const semS = cleSemaine(lundiS);
+      return Promise.all([Store.get(kPlanning(resto, semS)), Pointages.load(resto, semS)])
+        .then(([pl, pt]) => ({ lundiS, semS, pl, pt }));
+    })).then((resultats) => {
       if (!on) return;
-      const planningPrec = (pl && pl[id]) || null;
-      if (!planningPrec) { setPrec(null); return; }
-      const ptId = (pt && pt[id]) || {};
-      const joursTravailles = [];
-      for (let j = 0; j < 7; j++) if (planningPrec[j] && estJourTravaille(planningPrec[j].statut)) joursTravailles.push(j);
-      const signee = !!(ptId.semaine && ptId.semaine.signee);
-      if (joursTravailles.length === 0 || signee) { setPrec(null); return; }
-      const joursConfirmes = joursTravailles.filter((j) => ptId[j] && ptId[j].confirme);
-      const tousConfirmes = joursConfirmes.length === joursTravailles.length;
-      setPrec({ sem: semPrec, lundi: lundiPrec, planning: planningPrec, pointages: ptId, joursTravailles, tousConfirmes });
+      const liste = [];
+      resultats.forEach(({ lundiS, semS, pl, pt }) => {
+        const planningS = (pl && pl[id]) || null;
+        if (!planningS) return;
+        const ptId = (pt && pt[id]) || {};
+        const joursTravailles = [];
+        for (let j = 0; j < 7; j++) if (planningS[j] && estJourTravaille(planningS[j].statut)) joursTravailles.push(j);
+        if (joursTravailles.length === 0) return;
+        const signee = !!(ptId.semaine && ptId.semaine.signee);
+        if (signee) return;
+        const joursConfirmes = joursTravailles.filter((j) => ptId[j] && ptId[j].confirme);
+        const tousConfirmes = joursConfirmes.length === joursTravailles.length;
+        liste.push({ sem: semS, lundi: lundiS, planning: planningS, pointages: ptId, joursTravailles, tousConfirmes });
+      });
+      liste.sort((a, b) => b.sem.localeCompare(a.sem));
+      setPrec(liste);
     });
     return () => { on = false; };
   }, [resto, id, sem]);
 
-  function confirmerJourPrecedent(j) {
+  function confirmerJourPrecedent(semTarget, j) {
     if (!prec) return;
-    const p = prec.planning[j];
+    const w = prec.find((x) => x.sem === semTarget);
+    if (!w) return;
+    const p = w.planning[j];
     if (!p || !estJourTravaille(p.statut)) return;
-    if (prec.pointages[j] && prec.pointages[j].confirme) return;
+    if (w.pointages[j] && w.pointages[j].confirme) return;
     const nextJour = { confirme: "rattrapé", debut: p.debut, fin: p.fin, pause: p.pause || 0 };
-    const nextPt = { ...prec.pointages, [j]: nextJour };
-    const joursConfirmes = prec.joursTravailles.filter((jj) => nextPt[jj] && nextPt[jj].confirme);
-    const tousConfirmes = joursConfirmes.length === prec.joursTravailles.length;
-    setPrec({ ...prec, pointages: nextPt, tousConfirmes });
-    Pointages.setJour(resto, prec.sem, id, j, nextJour);
+    const nextPt = { ...w.pointages, [j]: nextJour };
+    const joursConfirmes = w.joursTravailles.filter((jj) => nextPt[jj] && nextPt[jj].confirme);
+    const tousConfirmes = joursConfirmes.length === w.joursTravailles.length;
+    const nextW = { ...w, pointages: nextPt, tousConfirmes };
+    setPrec(prec.map((x) => (x.sem === semTarget ? nextW : x)));
+    Pointages.setJour(resto, semTarget, id, j, nextJour);
   }
 
-  function validerSemainePrecedente() {
-    if (!prec || !prec.tousConfirmes) return;
-    Pointages.setSemaine(resto, prec.sem, id, { signee: true });
-    setPrec(null);
+  function validerSemainePrecedente(semTarget) {
+    const w = prec && prec.find((x) => x.sem === semTarget);
+    if (!w || !w.tousConfirmes) return;
+    setPrec(prec.filter((x) => x.sem !== semTarget));
+    Pointages.setSemaine(resto, semTarget, id, { signee: true });
   }
 
   useEffect(() => {
@@ -1750,27 +1787,27 @@ function EmployeeView({ resto, emp, onBack }) {
         )}
       </div>
 
-      {prec && (
-        <div className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
-          <div style={{fontWeight:700,marginBottom:4,color:'#9A4A1B'}}>Semaine dernière — à valider avant ce soir</div>
+      {prec && prec.length > 0 && prec.map((w) => (
+        <div key={w.sem} className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
+          <div style={{fontWeight:700,marginBottom:4,color:'#9A4A1B'}}>Semaine du {fmtDate(w.lundi)} au {fmtDate(ajouterJours(w.lundi,6))} — à valider</div>
           <div className="ig-muted" style={{marginBottom:12}}>
-            Vous n'avez pas terminé la validation de la semaine du {fmtDate(prec.lundi)} au {fmtDate(ajouterJours(prec.lundi,6))}. Vous pouvez encore le faire aujourd'hui (lundi) ; passé ce délai, seul votre manager pourra la valider pour vous.
+            Cette semaine passée n'a pas été entièrement confirmée/signée. Vous pouvez encore le faire depuis ici.
           </div>
-          {prec.joursTravailles.filter((j)=>!(prec.pointages[j] && prec.pointages[j].confirme)).length > 0 && (
+          {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).length > 0 && (
             <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:14}}>
-              {prec.joursTravailles.filter((j)=>!(prec.pointages[j] && prec.pointages[j].confirme)).map((j)=>(
+              {w.joursTravailles.filter((j)=>!(w.pointages[j] && w.pointages[j].confirme)).map((j)=>(
                 <div key={j} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
-                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(prec.lundi,j))}</span></div>
-                  <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPrecedent(j)}>Confirmer ce jour</button>
+                  <div style={{fontSize:14}}><b style={{textTransform:'capitalize'}}>{JOURS[j]}</b> <span className="ig-muted">{fmtJour(ajouterJours(w.lundi,j))}</span></div>
+                  <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>confirmerJourPrecedent(w.sem, j)}>Confirmer ce jour</button>
                 </div>
               ))}
             </div>
           )}
-          <button className="ig-clock-btn" style={{background: prec.tousConfirmes?'var(--coral)':'var(--sand-2)', color: prec.tousConfirmes?'#fff':'var(--ink-soft)', minWidth:220, cursor: prec.tousConfirmes?'pointer':'not-allowed'}} disabled={!prec.tousConfirmes} onClick={validerSemainePrecedente}>
-            Je valide ma semaine dernière
+          <button className="ig-clock-btn" style={{background: w.tousConfirmes?'var(--coral)':'var(--sand-2)', color: w.tousConfirmes?'#fff':'var(--ink-soft)', minWidth:220, cursor: w.tousConfirmes?'pointer':'not-allowed'}} disabled={!w.tousConfirmes} onClick={()=>validerSemainePrecedente(w.sem)}>
+            Je valide cette semaine
           </button>
         </div>
-      )}
+      ))}
 
       {joursARattraper.length > 0 && (
         <div className="ig-card" style={{padding:'16px 20px',marginTop:18,border:'1.5px solid #E5A06A'}}>
