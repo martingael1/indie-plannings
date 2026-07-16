@@ -320,6 +320,14 @@ const Store = {
       .from("kv").upsert({ key, value }, { onConflict: "key" });
     if (error) console.error("Store.set:", key, error.message);
   },
+  // Récupère toutes les entrées dont la clé commence par un préfixe donné (ex: "extras:"),
+  // pour reconstituer un historique complet sans avoir à connaître à l'avance les mois existants.
+  async listByPrefix(prefix) {
+    const { data, error } = await supabase
+      .from("kv").select("key, value").like("key", `${prefix}%`);
+    if (error) { console.error("Store.listByPrefix:", prefix, error.message); return []; }
+    return data || [];
+  },
 };
 
 // ---------- Pointages (table dédiée, une ligne par salarié/jour) ----------
@@ -888,6 +896,15 @@ function calculExtra(heures, tauxNet, surHeuresOrigine) {
 const Extras = {
   async load(mois) { return (await Store.get(kExtras(mois))) || []; },
   async save(mois, liste) { await Store.set(kExtras(mois), liste); },
+  // Charge l'historique complet, tous mois confondus (équivalent de l'ancien Google Sheet
+  // où tout restait visible en permanence sur une seule feuille).
+  async loadAll() {
+    const lignes = await Store.listByPrefix("extras:");
+    const tout = [];
+    lignes.forEach((l) => { if (Array.isArray(l.value)) tout.push(...l.value); });
+    tout.sort((a, b) => b.date.localeCompare(a.date));
+    return tout;
+  },
 };
 const EtablissementsJuridique = {
   async load() { return (await Store.get(kEtablissementsJuridique)) || {}; },
@@ -1634,7 +1651,7 @@ function ExtraTab({ resto, superviseur }) {
   const [effectif, setEffectif] = useState([]);
   const [etabsJ, setEtabsJ] = useState({});
   const [salariesLegal, setSalariesLegal] = useState({});
-  const [moisDate] = useState(new Date());
+  const [moisDate, setMoisDate] = useState(new Date());
   const [liste, setListe] = useState(null);
   const [ajout, setAjout] = useState(false);
   const [fiche, setFiche] = useState(false);
@@ -1719,8 +1736,6 @@ function ExtraTab({ resto, superviseur }) {
   const monEquipeAilleurs = liste.filter((x) => x.restoOrigine === resto).sort((a, b) => b.date.localeCompare(a.date));
   const ficheOk = etabsJ[resto] && etabsJ[resto].siret && etabsJ[resto].raisonSociale;
 
-  const recapParEtab = calcRecapParEtab(liste);
-
   return (
     <div>
       <div className="ig-noprint" style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap',marginBottom:14}}>
@@ -1732,7 +1747,11 @@ function ExtraTab({ resto, superviseur }) {
       {flash && <div className="ig-status-line ig-noprint" style={{background:'#EAF3F3',marginBottom:14}}>{flash}</div>}
 
       <div className="ig-card" style={{padding:'16px 20px',marginBottom:18}}>
-        <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Extras chez {resto} — {MOIS_NOMS[moisDate.getMonth()]} {moisDate.getFullYear()}</div>
+        <div className="ig-noprint" style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
+          <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>setMoisDate(new Date(moisDate.getFullYear(), moisDate.getMonth()-1, 1))}><Icon.Back width={14} height={14}/></button>
+          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600}}>Extras chez {resto} — {MOIS_NOMS[moisDate.getMonth()]} {moisDate.getFullYear()}</div>
+          <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>setMoisDate(new Date(moisDate.getFullYear(), moisDate.getMonth()+1, 1))}><Icon.Chevron width={14} height={14}/></button>
+        </div>
         {mesDemandes.length === 0 ? <div className="ig-muted">Aucun extra ce mois-ci.</div> : (
           <div style={{display:'flex',flexDirection:'column',gap:10}}>
             {mesDemandes.map((x) => (
@@ -1767,39 +1786,96 @@ function ExtraTab({ resto, superviseur }) {
         </div>
       )}
 
-      {superviseur && (
-        <div className="ig-card" style={{padding:'16px 20px',marginBottom:18,borderColor:'var(--ink)'}}>
-          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Récap du mois — tous établissements (superviseur)</div>
-          {recapParEtab.length === 0 ? <div className="ig-muted">Rien à exporter ce mois-ci.</div> : (
-            <>
-              <table style={{width:'100%',fontSize:13,borderCollapse:'collapse',marginBottom:12}}>
-                <thead><tr style={{textAlign:'left'}}><th>Établissement</th><th>Heures</th><th>Prime Net</th><th>Prime Brute</th><th>Coût total</th></tr></thead>
-                <tbody>
-                  {recapParEtab.map((r) => (
-                    <tr key={r.resto} style={{borderTop:'1px solid var(--sand-2)'}}><td>{r.resto}</td><td>{r.heures}</td><td>{fmtEuro(r.primeNet)}</td><td>{fmtEuro(r.primeBrute)}</td><td>{fmtEuro(r.primeCoutTotal)}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-              <button className="ig-btn ig-btn-ghost" onClick={()=>exporterRecapExtras(liste, mois, `Extras_${mois}.xlsx`)}>⬇ Export récap extras (xlsx)</button>
-            </>
-          )}
-        </div>
-      )}
+      {superviseur && <VueGlobaleExtras />}
 
       {ajout && <AjoutExtraModal resto={resto} effectif={effectif} salariesLegal={salariesLegal} onValider={creerExtra} onClose={()=>setAjout(false)} />}
       {fiche && <FicheJuridiqueModal resto={resto} valeurs={etabsJ[resto]} onSave={enregistrerFiche} onClose={()=>setFiche(false)} />}
     </div>
   );
 }
-function calcRecapParEtab(liste) {
-  const realises = liste.filter((x) => x.statut === "realisee");
-  const parEtab = {};
-  realises.forEach((x) => {
-    const c = parEtab[x.resto] || { resto: x.resto, heures: 0, primeNet: 0, primeBrute: 0, primeCoutTotal: 0 };
-    c.heures += Number(x.heuresReelles) || 0; c.primeNet += x.primeNet || 0; c.primeBrute += x.primeBrute || 0; c.primeCoutTotal += x.primeCoutTotal || 0;
-    parEtab[x.resto] = c;
+// ---------- Vue globale des extras (superviseur) : équivalent permanent du Google Sheet ----------
+// Charge tout l'historique (tous mois confondus) et le garde consultable en direct dans l'appli,
+// avec recherche/filtre, plutôt que de n'exposer qu'un export ponctuel du mois en cours.
+function VueGlobaleExtras() {
+  const [tout, setTout] = useState(null);
+  const [recherche, setRecherche] = useState("");
+  const [filtreEtab, setFiltreEtab] = useState("");
+  const [filtreMois, setFiltreMois] = useState("");
+
+  useEffect(() => {
+    let on = true;
+    Extras.loadAll().then((l) => { if (on) setTout(l); });
+    return () => { on = false; };
+  }, []);
+
+  if (tout === null) return <div className="ig-card" style={{padding:'16px 20px',marginBottom:18}}><div className="ig-muted">Chargement de l'historique complet…</div></div>;
+
+  const etabs = Array.from(new Set(tout.map((x) => x.resto))).sort();
+  const moisDisponibles = Array.from(new Set(tout.map((x) => cleMois(new Date(x.date + "T00:00:00"))))).sort().reverse();
+
+  const q = normTxt(recherche);
+  const filtres = tout.filter((x) => {
+    if (filtreEtab && x.resto !== filtreEtab) return false;
+    if (filtreMois && cleMois(new Date(x.date + "T00:00:00")) !== filtreMois) return false;
+    if (q && !normTxt(`${x.salariePrenom} ${x.salarieNom} ${x.poste}`).includes(q)) return false;
+    return true;
   });
-  return Object.values(parEtab);
+
+  const totaux = filtres.reduce((acc, x) => {
+    if (x.statut === "realisee") {
+      acc.heures += Number(x.heuresReelles) || 0;
+      acc.primeNet += x.primeNet || 0; acc.primeBrute += x.primeBrute || 0; acc.primeCoutTotal += x.primeCoutTotal || 0;
+    }
+    return acc;
+  }, { heures: 0, primeNet: 0, primeBrute: 0, primeCoutTotal: 0 });
+
+  return (
+    <div className="ig-card" style={{padding:'16px 20px',marginBottom:18,borderColor:'var(--ink)'}}>
+      <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Historique complet des extras — tous établissements, tous mois</div>
+      <div className="ig-noprint" style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:12}}>
+        <input value={recherche} onChange={(e)=>setRecherche(e.target.value)} placeholder="Rechercher un salarié / poste…" style={{minWidth:200}} />
+        <select value={filtreEtab} onChange={(e)=>setFiltreEtab(e.target.value)}>
+          <option value="">Tous les établissements</option>
+          {etabs.map((r) => (<option key={r} value={r}>{r}</option>))}
+        </select>
+        <select value={filtreMois} onChange={(e)=>setFiltreMois(e.target.value)}>
+          <option value="">Tous les mois</option>
+          {moisDisponibles.map((m) => (<option key={m} value={m}>{m}</option>))}
+        </select>
+        <button className="ig-btn ig-btn-ghost" onClick={()=>exporterRecapExtras(filtres, filtreMois || "historique-complet", `Extras_${filtreMois || "historique-complet"}.xlsx`)}>⬇ Export (xlsx)</button>
+      </div>
+      <div className="ig-muted" style={{marginBottom:10,fontSize:13}}>
+        {filtres.length} extra{filtres.length>1?'s':''} · {totaux.heures}h validées · {fmtEuro(totaux.primeNet)} net · {fmtEuro(totaux.primeBrute)} brut · {fmtEuro(totaux.primeCoutTotal)} coût total
+      </div>
+      {filtres.length === 0 ? <div className="ig-muted">Aucun extra ne correspond.</div> : (
+        <div style={{overflowX:'auto',maxHeight:480,overflowY:'auto'}}>
+          <table style={{width:'100%',fontSize:12.5,borderCollapse:'collapse'}}>
+            <thead style={{position:'sticky',top:0,background:'var(--sand)'}}>
+              <tr style={{textAlign:'left'}}>
+                <th style={{padding:'6px 8px'}}>Date</th><th>Salarié</th><th>Poste</th><th>Origine</th><th>Destination</th><th>Statut</th><th>Heures</th><th>Prime Net</th><th>Prime Brute</th><th>Coût total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtres.map((x) => (
+                <tr key={x.id} style={{borderTop:'1px solid var(--sand-2)'}}>
+                  <td style={{padding:'6px 8px'}}>{fmtDate(new Date(x.date+"T00:00:00"))}</td>
+                  <td>{x.salariePrenom} {x.salarieNom}</td>
+                  <td>{x.poste}</td>
+                  <td>{x.restoOrigine}</td>
+                  <td>{x.resto}</td>
+                  <td>{x.statut === 'realisee' ? '✓ validé' : 'à valider'}</td>
+                  <td>{x.statut === 'realisee' ? x.heuresReelles : (x.heuresEstimees ?? '—')}</td>
+                  <td>{x.statut === 'realisee' ? fmtEuro(x.primeNet) : '—'}</td>
+                  <td>{x.statut === 'realisee' ? fmtEuro(x.primeBrute) : '—'}</td>
+                  <td>{x.statut === 'realisee' ? fmtEuro(x.primeCoutTotal) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ---------- Vue Manager ----------
