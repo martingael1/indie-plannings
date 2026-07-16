@@ -20,7 +20,7 @@ const PAYFIT_IDS = {"BENECKO_Alin":["69ddf8f996c38711f2319d79",""],"BILLERY_Él�
 // en écriture (seuls les utilisateurs connectés peuvent écrire). Le manager ne tape que le code.
 // -> Créez ce compte dans Supabase (Authentication → Users) avec EXACTEMENT cet e-mail et ce mot de passe.
 const CODE_MANAGER = "1942";                       // code tapé par le manager (modifiable ici)
-const CODE_SUPERVISEUR = "5804";                   // code superviseur (accès étendu, à réserver à Océane) — modifiable ici
+const CODE_SUPERVISEUR = "1608";                   // code superviseur (accès étendu, à réserver à Océane) — modifiable ici
 const MANAGER_EMAIL = "manager@indiegroup.fr";     // compte partagé (à créer dans Supabase)
 const MANAGER_SECRET = "IndieGroup-Manager-2026";  // mot de passe du compte partagé (>= 6 caractères)
 const JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
@@ -1325,13 +1325,6 @@ function ManagerView({ resto, onBack, superviseur }) {
     Pointages.setJour(resto, sem, id, j, nextJourData);
   }
 
-  function genererTout() {
-    const next = { ...planning };
-    team.forEach((e) => {
-      next[idSalarie(e)] = genererPlanningAuto(e, sem);
-    });
-    persistPlanning(next);
-  }
   function genererUn(e) {
     const next = { ...planning, [idSalarie(e)]: genererPlanningAuto(e, sem) };
     persistPlanning(next);
@@ -1601,7 +1594,6 @@ function ManagerView({ resto, onBack, superviseur }) {
       {vue === "planning" && (
         <>
           <div className="ig-noprint" style={{display:'flex',gap:10,marginBottom:14,alignItems:'center',flexWrap:'wrap'}}>
-            <button className="ig-btn ig-btn-primary" onClick={genererTout}><Icon.Wand/> Générer le planning automatique</button>
             <button className="ig-btn ig-btn-ghost" onClick={()=>setAjout(true)}>+ Ajouter un salarié</button>
             <button className="ig-btn ig-btn-ghost" onClick={()=>{ setModeSelect((v)=>!v); setSelection(new Set()); setConfirmLot(false); }} style={modeSelect?{borderColor:'var(--coral-d)',color:'var(--coral-d)'}:undefined}>🧹 {modeSelect?"Terminer le nettoyage":"Nettoyer l'effectif"}</button>
             <button className="ig-btn ig-btn-ghost" onClick={enregistrerModele} disabled={Object.keys(planning).length===0} title="Mémoriser les horaires de cette semaine comme modèle">★ Enregistrer comme modèle</button>
@@ -1953,8 +1945,8 @@ function EmployeeView({ resto, emp, onBack }) {
       {valide === false ? (
         <div className="ig-card ig-clock-card" style={{marginBottom:22}}>
           <div className="ig-clock-date" style={{textTransform:'capitalize',fontSize:18,marginBottom:18}}>{now.toLocaleDateString("fr-FR",{weekday:'long',day:'numeric',month:'long'})}</div>
-          <div style={{fontSize:18,fontWeight:600,fontFamily:"'Inter',system-ui,sans-serif"}}>Planning en cours de préparation</div>
-          <div className="ig-muted" style={{marginTop:8,maxWidth:380,marginLeft:'auto',marginRight:'auto'}}>Votre manager finalise le planning de la semaine. Revenez un peu plus tard : vous pourrez voir vos horaires et confirmer votre présence dès qu'il sera validé.</div>
+          <div style={{fontSize:18,fontWeight:600,fontFamily:"'Inter',system-ui,sans-serif"}}>Horaires en cours de préparation</div>
+          <div className="ig-muted" style={{marginTop:8,maxWidth:380,marginLeft:'auto',marginRight:'auto'}}>Votre manager finalise les horaires de la semaine. Revenez un peu plus tard : vous pourrez voir vos horaires et confirmer votre présence dès qu'ils seront validés.</div>
         </div>
       ) : valide === null ? (
         <div className="ig-card ig-clock-card" style={{marginBottom:22}}>
@@ -2174,7 +2166,7 @@ function EmployeeIdentify({ restaurants, onFound, onBack }) {
       <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={onBack} style={{marginBottom:20}}><Icon.Back/> Retour</button>
       <div className="ig-ic" style={{background:'var(--coral)',color:'#fff',width:46,height:46,borderRadius:12,display:'flex',alignItems:'center',justifyContent:'center',marginBottom:16}}><Icon.User/></div>
       <h1 className="ig-display" style={{fontFamily:"'Inter', system-ui, sans-serif",fontWeight:700,letterSpacing:'-.4px',fontSize:32,marginBottom:8}}>Qui suis-je ?</h1>
-      <p style={{marginBottom:20}}>Indiquez votre prénom, votre nom et votre restaurant pour accéder à votre planning.</p>
+      <p style={{marginBottom:20}}>Indiquez votre prénom, votre nom et votre restaurant pour accéder à votre espace.</p>
       <div className="ig-field">
         <label>Prénom</label>
         <input value={prenom} autoFocus onChange={(e)=>{ setPrenom(e.target.value); resetReco(); }} onKeyDown={onKey} placeholder="Votre prénom" />
@@ -2213,7 +2205,7 @@ function EmployeeIdentify({ restaurants, onFound, onBack }) {
         <div style={{color:'var(--coral-d)',fontSize:13,marginBottom:12,fontWeight:600}}>Aucune correspondance dans ce restaurant. Vérifiez l'orthographe ou le restaurant choisi.</div>
       )}
 
-      <button className="ig-btn ig-btn-primary" onClick={valider}>Voir mon planning</button>
+      <button className="ig-btn ig-btn-primary" onClick={valider}>Valider</button>
     </div>
   );
 }
