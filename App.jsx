@@ -378,6 +378,16 @@ const kModele = (resto) => `modele:${slugKey(resto)}`;
 const kEtablissements = "etablissements";
 // Validation du planning d'une semaine (booléen) : publie le planning aux salariés.
 const kValidation = (resto, sem) => `validation:${slugKey(resto)}:${sem}`;
+// Extras (prêt de main-d'œuvre) : une seule liste par mois calendaire, partagée entre tous
+// les établissements (comme l'ancien "Réponses au formulaire" partagé). mois = "AAAA-MM".
+const kExtras = (mois) => `extras:${mois}`;
+// Fiche juridique de chaque établissement (raison sociale, SIRET...) : nécessaire pour
+// générer les contrats de prêt. Clé unique, valeur = { [resto]: {...} }.
+const kEtablissementsJuridique = "etablissements_juridique";
+// Informations légales des salariés (naissance, adresse, n° sécu...), saisies une seule
+// fois par un manager puis réutilisées pour tous les contrats suivants du même salarié.
+const kSalariesLegal = "salaries_legal";
+function cleMois(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
 
 // ---------- Icônes (SVG inline, pas de dépendance) ----------
 const Icon = {
@@ -849,6 +859,216 @@ function exporterCongesPayFit(lignesAbsences, nomFichier) {
   return [...manquants];
 }
 
+// ============================================================================
+//  Extras (prêt de main-d'œuvre entre établissements)
+// ============================================================================
+// Reprend le circuit papier existant : un directeur qui a besoin d'un extra pour une
+// soirée choisit un salarié d'un AUTRE établissement du groupe ; l'appli génère aussitôt
+// (avant le service, comme l'exige le Code du travail) le contrat de prêt de main-d'œuvre
+// et l'avenant du salarié. Une fois la soirée passée, le directeur saisit les heures
+// réellement faites : les mêmes champs que l'ancien formulaire Google (établissement,
+// date, nom/prénom, établissement d'origine, heures, taux net, "sur heures d'origine ?").
+
+function fmtEuro(n) {
+  return (Number(n) || 0).toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
+}
+
+// Constantes reprises telles quelles du fichier Excel historique (taux net -> brut, puis
+// brut -> coût total employeur pour une prime exceptionnelle). Ne pas modifier sans
+// revalider avec la compta / PayFit.
+const EXTRA_NET_VERS_BRUT = 1.2667;
+const EXTRA_BRUT_VERS_COUT_TOTAL = 1.4444;
+function calculExtra(heures, tauxNet, surHeuresOrigine) {
+  const h = Number(heures) || 0, t = Number(tauxNet) || 0;
+  if (surHeuresOrigine) return { tauxBrut: 0, primeNet: 0, primeBrute: 0, primeCoutTotal: 0 };
+  const tauxBrut = t * EXTRA_NET_VERS_BRUT;
+  return { tauxBrut, primeNet: h * t, primeBrute: h * tauxBrut, primeCoutTotal: tauxBrut * EXTRA_BRUT_VERS_COUT_TOTAL * h };
+}
+
+const Extras = {
+  async load(mois) { return (await Store.get(kExtras(mois))) || []; },
+  async save(mois, liste) { await Store.set(kExtras(mois), liste); },
+};
+const EtablissementsJuridique = {
+  async load() { return (await Store.get(kEtablissementsJuridique)) || {}; },
+  async save(tous) { await Store.set(kEtablissementsJuridique, tous); },
+};
+const SalariesLegal = {
+  async load() { return (await Store.get(kSalariesLegal)) || {}; },
+  async save(tous) { await Store.set(kSalariesLegal, tous); },
+};
+
+// Charge l'effectif actuel de plusieurs établissements (fichier + salariés ajoutés dans
+// l'appli, hors salariés partis) : sert au sélecteur "quel salarié fait l'extra ce soir ?",
+// qui doit pouvoir trouver un salarié de N'IMPORTE quel établissement du groupe.
+async function chargerEffectifGlobal(restaurants) {
+  const aujourdHui = new Date().toISOString().slice(0, 10);
+  const rosters = await Promise.all(restaurants.map((r) => Store.get(kRoster(r))));
+  const tous = [];
+  restaurants.forEach((r, i) => {
+    const roster = rosters[i] || {};
+    const supprimes = new Set(roster.supprimes || []);
+    const departs = roster.departs || {};
+    const base = EMPLOYEES.filter((e) => e.r === r).concat(roster.ajouts || []);
+    base.forEach((e) => {
+      const id = idSalarie(e);
+      if (supprimes.has(id)) return;
+      const fin = departs[id];
+      if (fin && fin < aujourdHui) return;
+      tous.push(e);
+    });
+  });
+  return tous;
+}
+
+const TYPES_CONTRAT = ["CDI", "CDD", "Extra / Saisonnier", "Apprentissage"];
+
+// Style commun aux documents juridiques imprimés (contrat + avenant).
+const STYLE_CONTRAT = `
+  h1 { font-size:16px; letter-spacing:.5px; }
+  .sub { display:none; }
+  p, li { font-size:12.5px; line-height:1.55; text-align:justify; margin:0 0 8px; }
+  h2 { font-size:13px; margin:18px 0 6px; }
+  .parties { display:flex; gap:24px; margin:14px 0; }
+  .partie { flex:1; font-size:12.5px; line-height:1.5; }
+  .partie b { display:block; margin-bottom:2px; }
+  .signatures { display:flex; gap:18px; margin-top:46px; }
+  .signatures div { flex:1; font-size:12px; text-align:center; }
+  .signatures div .ligne { margin-top:56px; border-top:1px solid #15303B; padding-top:4px; }
+  .manque { color:#B23A2E; font-weight:700; }
+`;
+
+function valEtab(j, champ) { return (j && j[champ]) ? esc(j[champ]) : `<span class="manque">[${champ} à compléter]</span>`; }
+
+// Construit le corps HTML du contrat de prêt de main-d'œuvre (entre les deux sociétés),
+// conforme aux articles L.8241-1 et suivants du Code du travail (prêt à but non lucratif).
+function construireContratPretHTML({ origineJ, destJ, salarie, salarieLegal, poste, date, heures, tauxNet, dateGeneration }) {
+  const dateFr = fmtDate(new Date(date + "T00:00:00"));
+  const genFr = fmtDate(dateGeneration);
+  return `
+    <h1>CONTRAT DE PRÊT DE MAIN-D'ŒUVRE</h1>
+    <p style="text-align:center">Entre les soussignées :</p>
+    <div class="parties">
+      <div class="partie"><b>La société prêteuse (établissement d'origine du salarié)</b>
+        ${valEtab(origineJ,'raisonSociale')}<br>${valEtab(origineJ,'adresse')}<br>${valEtab(origineJ,'cp')} ${valEtab(origineJ,'ville')}<br>
+        Au capital de ${valEtab(origineJ,'capital')}<br>RCS ${valEtab(origineJ,'rcs')}<br>SIRET : ${valEtab(origineJ,'siret')}<br>APE ${valEtab(origineJ,'ape')}<br>
+        ci-après « l'Entreprise prêteuse »</div>
+      <div class="partie"><b>La société utilisatrice (établissement d'accueil pour la soirée)</b>
+        ${valEtab(destJ,'raisonSociale')}<br>${valEtab(destJ,'adresse')}<br>${valEtab(destJ,'cp')} ${valEtab(destJ,'ville')}<br>
+        Au capital de ${valEtab(destJ,'capital')}<br>RCS ${valEtab(destJ,'rcs')}<br>SIRET : ${valEtab(destJ,'siret')}<br>APE ${valEtab(destJ,'ape')}<br>
+        ci-après « l'Entreprise utilisatrice »</div>
+    </div>
+    <p><b>IL A ÉTÉ CONVENU CE QUI SUIT :</b></p>
+    <h2>Article 1 – Cadre juridique</h2>
+    <p>Le présent contrat est conclu conformément aux articles L.8241-1 et suivants du Code du travail, dans le cadre d'un prêt de main-d'œuvre à but non lucratif. L'Entreprise prêteuse met temporairement à disposition de l'Entreprise utilisatrice un de ses salariés, sans facturation de marge bénéficiaire.</p>
+    <h2>Article 2 – Salarié concerné</h2>
+    <p>Le salarié mis à disposition est : <b>${esc(salarie.p)} ${esc(salarie.n)}</b><br>
+    Né(e) le ${salarieLegal.naissance ? esc(salarieLegal.naissance) : '<span class="manque">[date de naissance à compléter]</span>'} à ${salarieLegal.lieuNaissance ? esc(salarieLegal.lieuNaissance) : '<span class="manque">[lieu à compléter]</span>'}, de nationalité ${salarieLegal.nationalite ? esc(salarieLegal.nationalite) : '<span class="manque">[à compléter]</span>'}.<br>
+    Demeurant : ${salarieLegal.adresse ? esc(salarieLegal.adresse) : '<span class="manque">[adresse à compléter]</span>'}<br>
+    Numéro de sécurité sociale : ${salarieLegal.secu ? esc(salarieLegal.secu) : '<span class="manque">[n° sécu à compléter]</span>'}<br>
+    Contrat de travail : ${salarieLegal.typeContrat ? esc(salarieLegal.typeContrat) : '<span class="manque">[type de contrat à compléter]</span>'}</p>
+    <p>Le salarié a donné son accord préalable à la présente mise à disposition.</p>
+    <h2>Article 3 – Objet de la mise à disposition</h2>
+    <p>La mise à disposition a pour objet de permettre au salarié d'exécuter une mission temporaire au sein de l'Entreprise utilisatrice afin de répondre à un besoin ponctuel d'activité. Le salarié exercera les fonctions suivantes : <b>${esc(poste)}</b>.</p>
+    <h2>Article 4 – Durée de la mission</h2>
+    <p>La mise à disposition est consentie pour la soirée du <b>${dateFr}</b>.<br>Date de début : ${dateFr} — Date de fin : ${dateFr}.<br>Toute prolongation devra faire l'objet d'un avenant écrit signé par l'ensemble des parties.</p>
+    <h2>Article 5 – Conditions d'exécution du travail</h2>
+    <p>Pendant la durée de la mise à disposition, le salarié demeure lié par son contrat de travail à l'Entreprise prêteuse. L'Entreprise utilisatrice est responsable des conditions d'exécution du travail, notamment en matière d'horaires, de sécurité, d'hygiène et de discipline. L'Entreprise prêteuse conserve l'autorité relative à la gestion administrative du contrat de travail (paie, congés, sanctions disciplinaires, rupture éventuelle du contrat).</p>
+    <h2>Article 6 – Rémunération et charges sociales</h2>
+    <p>L'Entreprise prêteuse demeure seule responsable du versement de la rémunération du salarié ainsi que du paiement des cotisations sociales afférentes. L'Entreprise utilisatrice remboursera à l'Entreprise prêteuse, sur présentation de justificatifs, le coût strictement supporté (salaire brut, charges sociales patronales, frais professionnels directement liés à la mission). Aucune marge, commission ou bénéfice ne sera appliqué.</p>
+    <p>Base convenue pour cette soirée : ${heures ? esc(String(heures)) : '(à valider après la soirée)'} heure(s) à ${fmtEuro(tauxNet)} net de l'heure.</p>
+    <h2>Article 7 – Temps de travail</h2>
+    <p>Le salarié effectuera un horaire de travail conforme aux usages et à la réglementation applicable au sein de l'Entreprise utilisatrice. Les heures effectuées seront validées par l'Entreprise utilisatrice et transmises à l'Entreprise prêteuse.</p>
+    <h2>Article 8 – Responsabilité et assurances</h2>
+    <p>L'Entreprise utilisatrice est responsable des conditions d'accueil et d'exécution de la mission, notamment en matière de santé et de sécurité au travail. Tout accident du travail devra être signalé sans délai à l'Entreprise prêteuse.</p>
+    <h2>Article 9 – Confidentialité</h2>
+    <p>Le salarié s'engage à respecter une obligation stricte de confidentialité concernant toutes les informations dont il pourrait avoir connaissance dans le cadre de sa mission au sein de l'Entreprise utilisatrice.</p>
+    <h2>Article 10 – Résiliation anticipée</h2>
+    <p>Le présent contrat pourra être résilié de manière anticipée d'un commun accord entre les parties, en cas de manquement grave de l'une des parties, ou en cas de force majeure. Toute résiliation anticipée devra être notifiée par écrit.</p>
+    <h2>Article 11 – Droit applicable et litiges</h2>
+    <p>Le présent contrat est soumis au droit français. Tout litige relatif à son interprétation ou à son exécution relèvera de la compétence des tribunaux territorialement compétents.</p>
+    <p>Fait le ${genFr}, en trois exemplaires originaux.</p>
+    <div class="signatures">
+      <div>LE SALARIÉ<div class="ligne">${esc(salarie.p)} ${esc(salarie.n)}</div></div>
+      <div>Pour l'Entreprise utilisatrice<div class="ligne">${valEtab(destJ,'raisonSociale')}</div></div>
+      <div>Pour la société prêteuse<div class="ligne">${valEtab(origineJ,'raisonSociale')}</div></div>
+    </div>`;
+}
+
+// Construit le corps HTML de l'avenant de prêt temporaire (côté salarié), plus court,
+// remis en complément du contrat entre sociétés.
+function construireAvenantHTML({ origineNom, destNom, salarie, poste, date, dateGeneration }) {
+  const dateFr = fmtDate(new Date(date + "T00:00:00"));
+  const genFr = fmtDate(dateGeneration);
+  return `
+    <h1>AVENANT DE PRÊT TEMPORAIRE</h1>
+    <p class="sub" style="display:block;text-align:center;margin-bottom:14px">De la société ${esc(origineNom)} vers ${esc(destNom)}</p>
+    <p>Nous vous confirmons votre prêt auprès de la société citée ci-dessus selon les modalités suivantes.</p>
+    <h2>Article 1 : objet du prêt</h2>
+    <p><b>${esc(salarie.p)} ${esc(salarie.n)}</b><br>Vous serez détaché(e) de l'entreprise ${esc(origineNom)} à la société ${esc(destNom)} et exercerez les fonctions de <b>${esc(poste)}</b>.</p>
+    <h2>Article 2 : durée du prêt</h2>
+    <p>Ce prêt aura lieu à la date suivante : ${dateFr}.</p>
+    <h2>Article 3 : conditions d'exécution du prêt</h2>
+    <p>Pendant la durée du prêt auprès de la société ${esc(destNom)}, vous resterez salarié(e) de l'entreprise ${esc(origineNom)}. Vous vous engagez à respecter les instructions et consignes de sécurité qui vous seront données, identiques à celles de votre établissement d'origine. Vous vous conformerez aux horaires et règles applicables au service au sein duquel vous êtes affecté(e).</p>
+    <h2>Article 4 – Fin du prêt</h2>
+    <p>À la fin du prêt, vous serez automatiquement réintégré(e) dans votre poste au sein de votre entreprise d'origine.</p>
+    <h2>Article 5 : divers</h2>
+    <p>Ce prêt s'effectue selon les modalités légales en vigueur. Les autres dispositions de votre contrat de travail demeurent inchangées.</p>
+    <p>Fait le ${genFr}.<br><i>Faire précéder la signature de la mention manuscrite « Lu et approuvé »</i></p>
+    <div class="signatures">
+      <div>Le (la) salarié(e)<div class="ligne">${esc(salarie.p)} ${esc(salarie.n)}</div></div>
+      <div>Pour la société ${esc(origineNom)}<div class="ligne">&nbsp;</div></div>
+    </div>`;
+}
+
+// Génère et enregistre (dans l'enregistrement extra lui-même) le contrat + l'avenant,
+// horodatés au moment de la création de l'extra — donc avant la soirée, comme l'exige la loi.
+function genererDocumentsExtra(extra, etabsJ, salarieLegal) {
+  const origineJ = etabsJ[extra.restoOrigine] || null;
+  const destJ = etabsJ[extra.resto] || null;
+  const dateGeneration = new Date();
+  const salarie = { n: extra.salarieNom, p: extra.salariePrenom };
+  const contratHTML = construireContratPretHTML({ origineJ, destJ, salarie, salarieLegal: salarieLegal || {}, poste: extra.poste, date: extra.date, heures: extra.heuresEstimees, tauxNet: extra.tauxHoraireNet, dateGeneration });
+  const avenantHTML = construireAvenantHTML({ origineNom: (origineJ && origineJ.raisonSociale) || extra.restoOrigine, destNom: (destJ && destJ.raisonSociale) || extra.resto, salarie, poste: extra.poste, date: extra.date, dateGeneration });
+  return { contratHTML, avenantHTML, contratGenereAt: dateGeneration.toISOString() };
+}
+
+// Export du récap mensuel des extras : une feuille "Détail" (une ligne par extra, mêmes
+// colonnes que l'ancien formulaire) + une feuille "Récap par salarié" (totaux du mois),
+// pour reprendre le travail d'intégration des primes en variables PayFit.
+function exporterRecapExtras(liste, mois, nomFichier) {
+  const realises = liste.filter((x) => x.statut === "realisee");
+  const enteteDetail = ["Établissement", "Date", "Nom", "Prénom", "Établissement d'origine", "Poste", "Heures", "Taux horaire net", "Sur heures d'origine", "Taux horaire brut", "Prime Net", "Prime Brute", "Prime Coût Total", "Mois"];
+  const aoaDetail = [enteteDetail];
+  realises.forEach((x) => {
+    aoaDetail.push([x.resto, x.date, x.salarieNom, x.salariePrenom, x.restoOrigine, x.poste, x.heuresReelles, x.tauxHoraireNet, x.surHeuresOrigine ? "OUI" : "NON", x.tauxBrut, x.primeNet, x.primeBrute, x.primeCoutTotal, mois]);
+  });
+  const parSalarie = {};
+  realises.forEach((x) => {
+    const key = x.salarieId || idSalarie({ n: x.salarieNom, p: x.salariePrenom });
+    const pf = PAYFIT_IDS[key] || ["", ""];
+    const cur = parSalarie[key] || { nom: x.salarieNom, prenom: x.salariePrenom, identifiant: pf[0], matricule: pf[1], heures: 0, primeNet: 0, primeBrute: 0, primeCoutTotal: 0 };
+    cur.heures += Number(x.heuresReelles) || 0;
+    cur.primeNet += x.primeNet || 0;
+    cur.primeBrute += x.primeBrute || 0;
+    cur.primeCoutTotal += x.primeCoutTotal || 0;
+    parSalarie[key] = cur;
+  });
+  const aoaRecap = [["Identifiant PayFit", "Matricule", "Nom", "Prénom", "Total heures extra", "Total Prime Net", "Total Prime Brute", "Total Coût employeur", "Mois"]];
+  Object.values(parSalarie).forEach((c) => aoaRecap.push([c.identifiant, c.matricule, c.nom, c.prenom, c.heures, c.primeNet, c.primeBrute, c.primeCoutTotal, mois]));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoaDetail), "Détail extras");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoaRecap), "Récap par salarié");
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = nomFichier;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
 // ---------- Import d'un planning existant depuis Excel ----------
 // Lit un classeur au format "PLANNING N / PLANNING CUISINE N" (une feuille par petit
 // groupe de salariés, tous pour la même semaine en général) : ligne 1 = semaine (dates),
@@ -1244,13 +1464,351 @@ function AjoutModal({ resto, onAjouter, onClose }) {
   );
 }
 
+// ---------- Modal Fiche juridique d'un établissement (requis pour générer les contrats) ----------
+function FicheJuridiqueModal({ resto, valeurs, onSave, onClose }) {
+  const [f, setF] = useState({ raisonSociale: "", adresse: "", cp: "", ville: "", capital: "", rcs: "", siret: "", ape: "", ...(valeurs || {}) });
+  const champ = (label, key, placeholder) => (
+    <div className="ig-field">
+      <label>{label}</label>
+      <input value={f[key]} onChange={(e)=>setF({ ...f, [key]: e.target.value })} placeholder={placeholder} />
+    </div>
+  );
+  return (
+    <div className="ig-overlay" onClick={onClose}>
+      <div className="ig-modal" onClick={(e)=>e.stopPropagation()}>
+        <h3>Fiche juridique — {resto}</h3>
+        <div className="ig-muted" style={{marginBottom:10}}>Ces informations apparaissent sur les contrats de prêt de main-d'œuvre générés pour cet établissement (comme société prêteuse ou utilisatrice).</div>
+        {champ("Raison sociale", "raisonSociale", "Ex : SAS INDIE BEACH")}
+        {champ("Adresse", "adresse", "Ex : Plage de Pampelonne")}
+        <div className="ig-times">
+          {champ("Code postal", "cp", "83350")}
+          {champ("Ville", "ville", "RAMATUELLE")}
+        </div>
+        {champ("Capital social", "capital", "Ex : 7 600 €")}
+        {champ("RCS", "rcs", "Ex : Fréjus 451 201 875")}
+        <div className="ig-times">
+          {champ("SIRET", "siret", "Ex : 45120187500023")}
+          {champ("APE", "ape", "Ex : 5610A")}
+        </div>
+        <div style={{display:'flex',gap:10,marginTop:18}}>
+          <button className="ig-btn ig-btn-ghost" style={{flex:1}} onClick={onClose}>Annuler</button>
+          <button className="ig-btn ig-btn-primary" style={{flex:1}} onClick={()=>onSave(f)}>Enregistrer</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Modal Ajout d'un extra (choix du salarié + génération immédiate du contrat) ----------
+function AjoutExtraModal({ resto, effectif, salariesLegal, onValider, onClose }) {
+  const [recherche, setRecherche] = useState("");
+  const [selection, setSelection] = useState(null);
+  const [poste, setPoste] = useState("");
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [heuresEstimees, setHeuresEstimees] = useState("");
+  const [tauxHoraireNet, setTauxHoraireNet] = useState("");
+  const [surHeuresOrigine, setSurHeuresOrigine] = useState(false);
+  const [accord, setAccord] = useState(false);
+  const [legal, setLegal] = useState({ naissance: "", lieuNaissance: "", nationalite: "", adresse: "", secu: "", typeContrat: "" });
+  const [err, setErr] = useState("");
+
+  const candidats = useMemo(() => {
+    const q = normTxt(recherche);
+    if (!q) return [];
+    return effectif.filter((e) => e.r !== resto && (normTxt(e.n).includes(q) || normTxt(e.p).includes(q) || normTxt(`${e.p} ${e.n}`).includes(q))).slice(0, 8);
+  }, [recherche, effectif, resto]);
+
+  function choisir(e) {
+    setSelection(e);
+    setRecherche(`${e.p} ${e.n}`);
+    setPoste(e.po || "");
+    setLegal({ naissance: "", lieuNaissance: "", nationalite: "", adresse: "", secu: "", typeContrat: "", ...(salariesLegal[idSalarie(e)] || {}) });
+  }
+
+  function valider() {
+    if (!selection) { setErr("Choisissez un salarié dans la liste (établissement d'origine différent du vôtre)."); return; }
+    if (!poste.trim()) { setErr("Indiquez le poste occupé pendant l'extra."); return; }
+    if (!date) { setErr("Indiquez la date de la soirée."); return; }
+    if (!surHeuresOrigine && (!tauxHoraireNet || Number(tauxHoraireNet) <= 0)) { setErr("Indiquez le taux horaire net (ou cochez « sur ses heures d'origine »)."); return; }
+    if (!accord) { setErr("Confirmez que le salarié est d'accord pour cet extra."); return; }
+    onValider({
+      salarieId: idSalarie(selection), salarie: selection, poste: poste.trim(), date,
+      heuresEstimees: heuresEstimees === "" ? null : Number(heuresEstimees),
+      tauxHoraireNet: Number(tauxHoraireNet) || 0, surHeuresOrigine, legal,
+    });
+  }
+
+  return (
+    <div className="ig-overlay" onClick={onClose}>
+      <div className="ig-modal" onClick={(e)=>e.stopPropagation()} style={{maxWidth:520}}>
+        <h3>Ajouter un extra</h3>
+        <div className="ig-muted" style={{marginBottom:10}}>Choisissez un salarié d'un autre établissement du groupe : le contrat de prêt de main-d'œuvre est généré immédiatement, prêt à signer avant la soirée.</div>
+
+        <div className="ig-field" style={{position:'relative'}}>
+          <label>Salarié (autre établissement)</label>
+          <input value={recherche} onChange={(e)=>{ setRecherche(e.target.value); setSelection(null); setErr(""); }} placeholder="Tapez un nom…" />
+          {recherche && !selection && candidats.length > 0 && (
+            <div className="ig-card" style={{position:'absolute',zIndex:5,left:0,right:0,marginTop:4,padding:6,maxHeight:220,overflowY:'auto'}}>
+              {candidats.map((e) => (
+                <div key={idSalarie(e)} style={{padding:'8px 10px',cursor:'pointer',borderRadius:8}}
+                  onClick={()=>choisir(e)}
+                  onMouseDown={(ev)=>ev.preventDefault()}>
+                  <b>{e.p} {e.n}</b> <span className="ig-muted">· {e.po} · {e.r}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {recherche && !selection && candidats.length === 0 && (
+            <div className="ig-muted" style={{marginTop:6,fontSize:13}}>Aucun salarié d'un autre établissement ne correspond.</div>
+          )}
+        </div>
+
+        {selection && (
+          <>
+            <div className="ig-field">
+              <label>Poste occupé pendant l'extra</label>
+              <input value={poste} onChange={(e)=>setPoste(e.target.value)} placeholder="Ex : Runner" />
+            </div>
+            <div className="ig-times">
+              <div className="ig-field" style={{margin:0}}>
+                <label>Date de la soirée</label>
+                <input type="date" value={date} onChange={(e)=>setDate(e.target.value)} />
+              </div>
+              <div className="ig-field" style={{margin:0}}>
+                <label>Heures estimées (optionnel)</label>
+                <input type="number" min="0" step="0.5" value={heuresEstimees} onChange={(e)=>setHeuresEstimees(e.target.value)} placeholder="Saisies après la soirée si inconnu" />
+              </div>
+            </div>
+            <div className="ig-times">
+              <div className="ig-field" style={{margin:0}}>
+                <label>Taux horaire net</label>
+                <input type="number" min="0" step="0.5" value={tauxHoraireNet} onChange={(e)=>setTauxHoraireNet(e.target.value)} disabled={surHeuresOrigine} placeholder="€ / heure" />
+              </div>
+              <div className="ig-field" style={{margin:0,display:'flex',alignItems:'flex-end',paddingBottom:6}}>
+                <label style={{display:'flex',alignItems:'center',gap:8,fontWeight:400}}>
+                  <input type="checkbox" checked={surHeuresOrigine} onChange={(e)=>setSurHeuresOrigine(e.target.checked)} />
+                  Sur ses heures d'origine (non rémunéré en extra)
+                </label>
+              </div>
+            </div>
+
+            <div style={{fontWeight:600,fontSize:13,marginTop:14,marginBottom:4}}>Informations légales du salarié (pour le contrat)</div>
+            <div className="ig-muted" style={{fontSize:12,marginBottom:8}}>Saisies une seule fois, réutilisées pour ses prochains extras.</div>
+            <div className="ig-times">
+              <div className="ig-field" style={{margin:0}}><label>Né(e) le</label><input type="date" value={legal.naissance} onChange={(e)=>setLegal({...legal,naissance:e.target.value})} /></div>
+              <div className="ig-field" style={{margin:0}}><label>Lieu de naissance</label><input value={legal.lieuNaissance} onChange={(e)=>setLegal({...legal,lieuNaissance:e.target.value})} /></div>
+            </div>
+            <div className="ig-times">
+              <div className="ig-field" style={{margin:0}}><label>Nationalité</label><input value={legal.nationalite} onChange={(e)=>setLegal({...legal,nationalite:e.target.value})} /></div>
+              <div className="ig-field" style={{margin:0}}>
+                <label>Type de contrat</label>
+                <select value={legal.typeContrat} onChange={(e)=>setLegal({...legal,typeContrat:e.target.value})}>
+                  <option value="">—</option>
+                  {TYPES_CONTRAT.map((t)=>(<option key={t} value={t}>{t}</option>))}
+                </select>
+              </div>
+            </div>
+            <div className="ig-field"><label>Adresse</label><input value={legal.adresse} onChange={(e)=>setLegal({...legal,adresse:e.target.value})} /></div>
+            <div className="ig-field"><label>Numéro de sécurité sociale</label><input value={legal.secu} onChange={(e)=>setLegal({...legal,secu:e.target.value})} /></div>
+
+            <label style={{display:'flex',alignItems:'center',gap:8,fontSize:13,marginTop:10}}>
+              <input type="checkbox" checked={accord} onChange={(e)=>setAccord(e.target.checked)} />
+              Le salarié est d'accord pour effectuer cet extra
+            </label>
+          </>
+        )}
+
+        {err && <div style={{color:'var(--coral-d)',fontSize:13,marginTop:10,fontWeight:600}}>{err}</div>}
+        <div style={{display:'flex',gap:10,marginTop:18}}>
+          <button className="ig-btn ig-btn-ghost" style={{flex:1}} onClick={onClose}>Annuler</button>
+          <button className="ig-btn ig-btn-primary" style={{flex:1}} onClick={valider}>Créer l'extra et générer le contrat</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Onglet Extra (prêt de main-d'œuvre) ----------
+function ExtraTab({ resto, superviseur }) {
+  const [restaurants, setRestaurants] = useState([...RESTAURANTS]);
+  const [effectif, setEffectif] = useState([]);
+  const [etabsJ, setEtabsJ] = useState({});
+  const [salariesLegal, setSalariesLegal] = useState({});
+  const [moisDate] = useState(new Date());
+  const [liste, setListe] = useState(null);
+  const [ajout, setAjout] = useState(false);
+  const [fiche, setFiche] = useState(false);
+  const [flash, setFlash] = useState("");
+  const [heuresSaisie, setHeuresSaisie] = useState({});
+
+  const mois = cleMois(moisDate);
+
+  useEffect(() => {
+    let on = true;
+    Store.get(kEtablissements).then((v) => { if (on && Array.isArray(v) && v.length) setRestaurants(Array.from(new Set([...RESTAURANTS, ...v]))); });
+    return () => { on = false; };
+  }, []);
+
+  useEffect(() => {
+    let on = true;
+    Promise.all([chargerEffectifGlobal(restaurants), EtablissementsJuridique.load(), SalariesLegal.load(), Extras.load(mois)]).then(([eff, ej, sl, ex]) => {
+      if (!on) return;
+      setEffectif(eff); setEtabsJ(ej); setSalariesLegal(sl); setListe(ex);
+    });
+    return () => { on = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restaurants.length, mois]);
+
+  function montrerFlash(msg) { setFlash(msg); setTimeout(() => setFlash(""), 6000); }
+
+  async function persisterDans(moisCible, nouvelleListe) {
+    if (moisCible === mois) setListe(nouvelleListe);
+    await Extras.save(moisCible, nouvelleListe);
+  }
+
+  async function creerExtra({ salarieId, salarie, poste, date, heuresEstimees, tauxHoraireNet, surHeuresOrigine, legal }) {
+    const legalPropre = Object.fromEntries(Object.entries(legal).filter(([, v]) => v));
+    if (Object.keys(legalPropre).length) {
+      const nextLegal = { ...salariesLegal, [salarieId]: { ...(salariesLegal[salarieId] || {}), ...legalPropre } };
+      setSalariesLegal(nextLegal);
+      await SalariesLegal.save(nextLegal);
+    }
+    const nouveau = {
+      id: (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(16).slice(2)}`),
+      resto, restoOrigine: salarie.r, salarieId, salarieNom: salarie.n, salariePrenom: salarie.p,
+      poste, date, heuresEstimees, tauxHoraireNet, surHeuresOrigine,
+      statut: "a_valider", heuresReelles: null, payfitStatut: "a_faire", creeLe: new Date().toISOString(),
+    };
+    Object.assign(nouveau, genererDocumentsExtra(nouveau, etabsJ, { ...(salariesLegal[salarieId] || {}), ...legalPropre }));
+    const moisExtra = cleMois(new Date(date + "T00:00:00"));
+    const base = moisExtra === mois ? (liste || []) : await Extras.load(moisExtra);
+    await persisterDans(moisExtra, [...base, nouveau]);
+    setAjout(false);
+    montrerFlash(`Extra créé pour ${salarie.p} ${salarie.n} (${salarie.r} → ${resto}) le ${fmtDate(new Date(date + "T00:00:00"))}. Le contrat et l'avenant sont prêts.`);
+  }
+
+  async function validerHeures(id) {
+    const val = heuresSaisie[id];
+    if (val === undefined || val === "" || isNaN(Number(val))) return;
+    const next = (liste || []).map((x) => {
+      if (x.id !== id) return x;
+      const calc = calculExtra(val, x.tauxHoraireNet, x.surHeuresOrigine);
+      return { ...x, heuresReelles: Number(val), statut: "realisee", ...calc };
+    });
+    await persisterDans(mois, next);
+    montrerFlash("Heures enregistrées.");
+  }
+
+  function voirDocument(x, quel) {
+    const html = quel === "contrat" ? x.contratHTML : x.avenantHTML;
+    if (!html) return;
+    imprimerDocument(`${quel === "contrat" ? "Contrat de prêt" : "Avenant"} — ${x.salariePrenom} ${x.salarieNom}`, html, STYLE_CONTRAT, `${quel}_${slugKey(x.salariePrenom + "_" + x.salarieNom)}_${x.date}`);
+  }
+
+  async function enregistrerFiche(data) {
+    const next = { ...etabsJ, [resto]: data };
+    setEtabsJ(next);
+    await EtablissementsJuridique.save(next);
+    setFiche(false);
+    montrerFlash("Fiche juridique enregistrée.");
+  }
+
+  if (liste === null) return <div className="ig-muted">Chargement…</div>;
+
+  const mesDemandes = liste.filter((x) => x.resto === resto).sort((a, b) => b.date.localeCompare(a.date));
+  const monEquipeAilleurs = liste.filter((x) => x.restoOrigine === resto).sort((a, b) => b.date.localeCompare(a.date));
+  const ficheOk = etabsJ[resto] && etabsJ[resto].siret && etabsJ[resto].raisonSociale;
+
+  const recapParEtab = calcRecapParEtab(liste);
+
+  return (
+    <div>
+      <div className="ig-noprint" style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap',marginBottom:14}}>
+        <button className="ig-btn ig-btn-ink" onClick={()=>setAjout(true)}>+ Ajouter un extra</button>
+        <button className="ig-btn ig-btn-ghost" onClick={()=>setFiche(true)}>Fiche juridique de {resto}</button>
+        {!ficheOk && <span style={{color:'var(--coral-d)',fontSize:13,fontWeight:600}}>⚠ à compléter avant de générer des contrats valides</span>}
+      </div>
+
+      {flash && <div className="ig-status-line ig-noprint" style={{background:'#EAF3F3',marginBottom:14}}>{flash}</div>}
+
+      <div className="ig-card" style={{padding:'16px 20px',marginBottom:18}}>
+        <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Extras chez {resto} — {MOIS_NOMS[moisDate.getMonth()]} {moisDate.getFullYear()}</div>
+        {mesDemandes.length === 0 ? <div className="ig-muted">Aucun extra ce mois-ci.</div> : (
+          <div style={{display:'flex',flexDirection:'column',gap:10}}>
+            {mesDemandes.map((x) => (
+              <div key={x.id} style={{display:'flex',alignItems:'center',gap:12,flexWrap:'wrap',padding:'10px 0',borderTop:'1px solid var(--sand-2)'}}>
+                <div style={{minWidth:180}}><b>{x.salariePrenom} {x.salarieNom}</b><br /><span className="ig-muted" style={{fontSize:12}}>{x.restoOrigine} · {x.poste} · {fmtDate(new Date(x.date+"T00:00:00"))}</span></div>
+                <span className="ig-pill" style={{background: x.statut==='realisee' ? '#EAF3F3' : '#FCE5D6'}}>{x.statut === 'realisee' ? '✓ heures validées' : 'à valider'}</span>
+                <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>voirDocument(x,'contrat')}>Voir le contrat</button>
+                <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>voirDocument(x,'avenant')}>Voir l'avenant</button>
+                {x.statut !== 'realisee' && (
+                  <>
+                    <input type="number" min="0" step="0.25" style={{width:90}} placeholder={x.heuresEstimees ? String(x.heuresEstimees) : "Heures"} value={heuresSaisie[x.id] ?? ""} onChange={(e)=>setHeuresSaisie({...heuresSaisie,[x.id]:e.target.value})} />
+                    <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} onClick={()=>validerHeures(x.id)}>Valider les heures</button>
+                  </>
+                )}
+                {x.statut === 'realisee' && <span className="ig-muted" style={{fontSize:12}}>{x.heuresReelles}h · {fmtEuro(x.primeNet)} net</span>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {monEquipeAilleurs.length > 0 && (
+        <div className="ig-card" style={{padding:'16px 20px',marginBottom:18}}>
+          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Salariés de {resto} en extra ailleurs</div>
+          <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            {monEquipeAilleurs.map((x) => (
+              <div key={x.id} style={{display:'flex',alignItems:'center',gap:12,flexWrap:'wrap',padding:'8px 0',borderTop:'1px solid var(--sand-2)',fontSize:13}}>
+                <b>{x.salariePrenom} {x.salarieNom}</b><span className="ig-muted">→ {x.resto} · {fmtDate(new Date(x.date+"T00:00:00"))} · {x.statut === 'realisee' ? `${x.heuresReelles}h validées` : 'en attente des heures'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {superviseur && (
+        <div className="ig-card" style={{padding:'16px 20px',marginBottom:18,borderColor:'var(--ink)'}}>
+          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,fontWeight:600,marginBottom:10}}>Récap du mois — tous établissements (superviseur)</div>
+          {recapParEtab.length === 0 ? <div className="ig-muted">Rien à exporter ce mois-ci.</div> : (
+            <>
+              <table style={{width:'100%',fontSize:13,borderCollapse:'collapse',marginBottom:12}}>
+                <thead><tr style={{textAlign:'left'}}><th>Établissement</th><th>Heures</th><th>Prime Net</th><th>Prime Brute</th><th>Coût total</th></tr></thead>
+                <tbody>
+                  {recapParEtab.map((r) => (
+                    <tr key={r.resto} style={{borderTop:'1px solid var(--sand-2)'}}><td>{r.resto}</td><td>{r.heures}</td><td>{fmtEuro(r.primeNet)}</td><td>{fmtEuro(r.primeBrute)}</td><td>{fmtEuro(r.primeCoutTotal)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+              <button className="ig-btn ig-btn-ghost" onClick={()=>exporterRecapExtras(liste, mois, `Extras_${mois}.xlsx`)}>⬇ Export récap extras (xlsx)</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {ajout && <AjoutExtraModal resto={resto} effectif={effectif} salariesLegal={salariesLegal} onValider={creerExtra} onClose={()=>setAjout(false)} />}
+      {fiche && <FicheJuridiqueModal resto={resto} valeurs={etabsJ[resto]} onSave={enregistrerFiche} onClose={()=>setFiche(false)} />}
+    </div>
+  );
+}
+function calcRecapParEtab(liste) {
+  const realises = liste.filter((x) => x.statut === "realisee");
+  const parEtab = {};
+  realises.forEach((x) => {
+    const c = parEtab[x.resto] || { resto: x.resto, heures: 0, primeNet: 0, primeBrute: 0, primeCoutTotal: 0 };
+    c.heures += Number(x.heuresReelles) || 0; c.primeNet += x.primeNet || 0; c.primeBrute += x.primeBrute || 0; c.primeCoutTotal += x.primeCoutTotal || 0;
+    parEtab[x.resto] = c;
+  });
+  return Object.values(parEtab);
+}
+
 // ---------- Vue Manager ----------
 function ManagerView({ resto, onBack, superviseur }) {
   const [semDate, setSemDate] = useState(new Date());
   const [planning, setPlanning] = useState({}); // { idSalarie: { 0..6 } }
   const [pointages, setPointages] = useState({});
   const [edit, setEdit] = useState(null); // { emp, jour }
-  const [vue, setVue] = useState("planning"); // planning | emargement
+  const [vue, setVue] = useState("planning"); // planning | emargement | extra
   const [loading, setLoading] = useState(true);
   const [roster, setRoster] = useState({ ajouts: [], departs: {} });
   const [modele, setModele] = useState(null); // planning modèle enregistré pour le resto
@@ -1724,6 +2282,7 @@ function ManagerView({ resto, onBack, superviseur }) {
         <div style={{marginLeft:'auto',display:'flex',gap:8}}>
           <button className={"ig-btn ig-btn-sm "+(vue==='planning'?'ig-btn-ink':'ig-btn-ghost')} onClick={()=>setVue('planning')}><Icon.Calendar width={16} height={16}/> Planning</button>
           <button className={"ig-btn ig-btn-sm "+(vue==='emargement'?'ig-btn-ink':'ig-btn-ghost')} onClick={()=>setVue('emargement')}><Icon.Check/> Émargement</button>
+          <button className={"ig-btn ig-btn-sm "+(vue==='extra'?'ig-btn-ink':'ig-btn-ghost')} onClick={()=>setVue('extra')}><Icon.User width={16} height={16}/> Extra</button>
         </div>
       </div>
 
@@ -1733,7 +2292,7 @@ function ManagerView({ resto, onBack, superviseur }) {
         </div>
       )}
 
-      <WeekNav semDate={semDate} setSemDate={setSemDate} />
+      {vue !== "extra" && <WeekNav semDate={semDate} setSemDate={setSemDate} />}
 
       {vue === "planning" && (
         <>
@@ -1896,6 +2455,8 @@ function ManagerView({ resto, onBack, superviseur }) {
       {vue === "emargement" && (
         <EmargementSheet resto={resto} semDate={semDate} planning={planning} pointages={pointages} team={team} onToggleSignature={superviseur ? toggleSignatureManuelle : undefined} onToggleJour={superviseur ? toggleJourManuel : undefined} />
       )}
+
+      {vue === "extra" && <ExtraTab resto={resto} superviseur={superviseur} />}
 
       {edit && (
         <EditModal
