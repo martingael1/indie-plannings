@@ -1693,8 +1693,8 @@ function ExtraTab({ resto, superviseur }) {
       <div className="ig-noprint" style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap',marginBottom:14}}>
         <button className="ig-btn ig-btn-ink" onClick={()=>setAjout(true)}>+ Ajouter un extra</button>
         <a className="ig-btn ig-btn-ghost" href="https://forms.gle/pNFPqnH2eAX3C7gs7" target="_blank" rel="noopener noreferrer">+ Ajouter un extra extérieur</a>
-        <button className="ig-btn ig-btn-ghost" onClick={()=>setFiche(true)}>Fiche juridique de {resto}</button>
-        {!ficheOk && <span style={{color:'var(--coral-d)',fontSize:13,fontWeight:600}}>⚠ à compléter avant de générer des contrats valides</span>}
+        {superviseur && <button className="ig-btn ig-btn-ghost" onClick={()=>setFiche(true)}>Fiche juridique de {resto}</button>}
+        {superviseur && !ficheOk && <span style={{color:'var(--coral-d)',fontSize:13,fontWeight:600}}>⚠ à compléter avant de générer des contrats valides</span>}
       </div>
 
       {flash && <div className="ig-status-line ig-noprint" style={{background:'#EAF3F3',marginBottom:14}}>{flash}</div>}
