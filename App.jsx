@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabaseClient";
 // N'utiliser QUE les fonctions d'écriture de xlsx (aoa_to_sheet, book_new, write) sur des
 // données internes à l'appli — jamais XLSX.read()/readFile() sur un fichier externe : les
@@ -849,6 +849,99 @@ function exporterCongesPayFit(lignesAbsences, nomFichier) {
   return [...manquants];
 }
 
+// ---------- Import d'un planning existant depuis Excel ----------
+// Lit un classeur au format "PLANNING N / PLANNING CUISINE N" (une feuille par petit
+// groupe de salariés, tous pour la même semaine en général) : ligne 1 = semaine (dates),
+// puis par salarié 2 lignes (NOM, PRENOM) x 7 jours de 3 colonnes (début / "h" / pause-ou-OFF).
+// N'utilise XLSX.read() QUE sur un fichier que le superviseur choisit lui-même dans son
+// propre navigateur — jamais sur un contenu externe non fiable.
+function feuilleEnGrille(ws) {
+  if (!ws["!ref"]) return [];
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  const grille = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const ligne = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r, c })];
+      ligne.push(cell ? cell.v : undefined);
+    }
+    grille.push(ligne);
+  }
+  (ws["!merges"] || []).forEach((m) => {
+    const val = grille[m.s.r][m.s.c];
+    for (let r = m.s.r; r <= m.e.r; r++) for (let c = m.s.c; c <= m.e.c; c++) grille[r][c] = val;
+  });
+  return grille;
+}
+function fmtHeureImport(v) {
+  if (v == null) return null;
+  if (v instanceof Date) return String(v.getUTCHours()).padStart(2, "0") + ":" + String(v.getUTCMinutes()).padStart(2, "0");
+  if (typeof v === "number") {
+    const h = Math.floor(v), m = Math.round((v - h) * 60);
+    return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+  }
+  const s = String(v).trim().toUpperCase();
+  const m1 = s.match(/^(\d{1,2})H(\d{2})?$/);
+  if (m1) return String(Number(m1[1])).padStart(2, "0") + ":" + (m1[2] || "00");
+  const n = Number(s.replace(",", "."));
+  if (!isNaN(n)) { const h = Math.floor(n), mi = Math.round((n - h) * 60); return String(h).padStart(2, "0") + ":" + String(mi).padStart(2, "0"); }
+  return null;
+}
+function parsePauseImport(v) {
+  const s = (v == null ? "" : String(v)).toUpperCase();
+  const m = s.match(/(\d+)\s*H/);
+  if (m) return Number(m[1]);
+  const mm = s.match(/(\d+)\s*MIN/);
+  if (mm) return Number(mm[1]) / 60;
+  return 1; // valeur par défaut si la case pause est vide ou illisible
+}
+// Décode une feuille "PLANNING ..." en { sem, lundi, entries:[{emp,jours}], nonReconnus:[...] }.
+function parseSemaineDepuisFeuille(grille, resto, ajouts) {
+  const dateBrute = grille[0] && grille[0][1];
+  let lundiDate = dateBrute instanceof Date ? new Date(dateBrute.getUTCFullYear(), dateBrute.getUTCMonth(), dateBrute.getUTCDate()) : null;
+  if (!lundiDate) return null;
+  lundiDate = lundiDeLaSemaine(lundiDate);
+  const sem = cleSemaine(lundiDate);
+  const JOURS_COLS = [3, 6, 9, 12, 15, 18, 21]; // D,G,J,M,P,S,V (0-indexé)
+  const entries = [];
+  const nonReconnus = [];
+  const approximatifs = [];
+  let videsConsecutifs = 0;
+  for (let r = 3; r < grille.length; r += 3) {
+    const nom = grille[r] && grille[r][1];
+    const prenom = grille[r + 1] && grille[r + 1][1];
+    if (!nom && !prenom) { videsConsecutifs++; if (videsConsecutifs >= 3) break; continue; }
+    videsConsecutifs = 0;
+    if (!nom || !prenom) continue;
+    // Recherche exacte d'abord ; si ça échoue (ex: nom de famille abrégé dans le fichier
+    // source), on retente en tolérant les fautes/abréviations, mais seulement si un SEUL
+    // candidat ressort clairement — sinon on préfère signaler plutôt que deviner.
+    let emp = trouverSalarie(String(prenom), String(nom), resto, ajouts || []);
+    let approx = false;
+    if (!emp) {
+      const suggestions = suggererSalaries(String(prenom), String(nom), resto, ajouts || []);
+      if (suggestions.length === 1) { emp = suggestions[0]; approx = true; }
+    }
+    const jours = {};
+    JOURS_COLS.forEach((c, j) => {
+      const pauseCase = (grille[r][c + 2] != null) ? grille[r][c + 2] : grille[r + 1][c + 2];
+      const pauseTxt = pauseCase == null ? "" : String(pauseCase).trim().toUpperCase();
+      if (pauseTxt === "OFF") { jours[j] = { statut: STATUTS.OFF, debut: "", fin: "", pause: 0 }; return; }
+      const debut = fmtHeureImport(grille[r][c]);
+      const fin = fmtHeureImport(grille[r + 1][c]);
+      if (!debut || !fin) return; // rien de fiable pour ce jour : on n'écrit rien plutôt que de deviner
+      jours[j] = { statut: STATUTS.TRAVAIL, debut, fin, pause: parsePauseImport(pauseCase) };
+    });
+    if (emp) {
+      entries.push({ emp, jours });
+      if (approx) approximatifs.push(`"${prenom} ${nom}" → ${emp.p} ${emp.n}`);
+    } else {
+      nonReconnus.push(`${prenom} ${nom}`);
+    }
+  }
+  return { sem, lundi: lundiDate, entries, nonReconnus, approximatifs };
+}
+
 // ---------- Feuille d'émargement (format du modèle papier) ----------
 function EmargementSheet({ resto, semDate, planning, pointages, team, onToggleSignature, onToggleJour }) {
   const lundi = lundiDeLaSemaine(semDate);
@@ -1173,6 +1266,9 @@ function ManagerView({ resto, onBack, superviseur }) {
   const [confirmLot, setConfirmLot] = useState(false); // confirmation du retrait en lot
   const [confirmForceModele, setConfirmForceModele] = useState(false); // confirmation de l'écrasement forcé par le modèle
   const [moisExport, setMoisExport] = useState(() => { const d = new Date(); return { annee: d.getFullYear(), mois: d.getMonth() + 1 }; }); // mois choisi pour l'export PayFit
+  const [importPreview, setImportPreview] = useState(null); // aperçu avant confirmation d'un import Excel
+  const [importEnCours, setImportEnCours] = useState(false);
+  const fileImportRef = useRef(null);
   const sem = cleSemaine(semDate);
 
   // Équipe effective : salariés du fichier + ajouts, moins ceux dont le contrat est terminé.
@@ -1384,6 +1480,54 @@ function ManagerView({ resto, onBack, superviseur }) {
     } finally {
       setExportEnCours(false);
     }
+  }
+
+  // Import d'un planning depuis un fichier Excel existant (format "PLANNING N" /
+  // "PLANNING CUISINE N"). Analyse d'abord (aperçu, rien n'est écrit), puis confirmation
+  // semaine par semaine avant d'écrire réellement dans la base.
+  async function analyserImportPlanning(file) {
+    setImportEnCours(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const semaines = {};
+      wb.SheetNames.filter((n) => /^PLANNING/i.test(n)).forEach((n) => {
+        const grille = feuilleEnGrille(wb.Sheets[n]);
+        const res = parseSemaineDepuisFeuille(grille, resto, roster.ajouts || []);
+        if (!res) return;
+        if (!semaines[res.sem]) semaines[res.sem] = { sem: res.sem, lundi: res.lundi, entriesById: new Map(), nonReconnus: new Set(), approximatifs: new Set() };
+        res.entries.forEach(({ emp, jours }) => {
+          const id = idSalarie(emp);
+          const cur = semaines[res.sem].entriesById.get(id) || { emp, jours: {} };
+          semaines[res.sem].entriesById.set(id, { emp, jours: { ...cur.jours, ...jours } });
+        });
+        res.nonReconnus.forEach((n2) => semaines[res.sem].nonReconnus.add(n2));
+        (res.approximatifs || []).forEach((n2) => semaines[res.sem].approximatifs.add(n2));
+      });
+      const liste = Object.values(semaines)
+        .map((s) => ({ sem: s.sem, lundi: s.lundi, entries: [...s.entriesById.values()], nonReconnus: [...s.nonReconnus], approximatifs: [...s.approximatifs] }))
+        .sort((a, b) => a.sem.localeCompare(b.sem));
+      if (liste.length === 0) {
+        montrerFlash("Aucune feuille \"PLANNING…\" avec une semaine reconnaissable n'a été trouvée dans ce fichier.");
+      }
+      setImportPreview({ liste, fichierNom: file.name });
+    } catch (err) {
+      montrerFlash("Impossible de lire ce fichier : " + err.message);
+    } finally {
+      setImportEnCours(false);
+    }
+  }
+  async function confirmerImportSemaine(item) {
+    const existant = (await Store.get(kPlanning(resto, item.sem))) || {};
+    const next = { ...existant };
+    item.entries.forEach(({ emp, jours }) => {
+      const id = idSalarie(emp);
+      next[id] = { ...(next[id] || {}), ...jours };
+    });
+    await Store.set(kPlanning(resto, item.sem), next);
+    if (item.sem === sem) setPlanning(next);
+    montrerFlash(`Semaine du ${fmtDate(item.lundi)} importée : ${item.entries.length} salarié${item.entries.length > 1 ? 's' : ''}.`);
+    setImportPreview((cur) => cur ? { ...cur, liste: cur.liste.filter((x) => x.sem !== item.sem) } : cur);
   }
   function imprimerPlanning() {
     const lundi = lundiDeLaSemaine(semDate);
@@ -1611,6 +1755,8 @@ function ManagerView({ resto, onBack, superviseur }) {
                   {[moisExport.annee-1, moisExport.annee, moisExport.annee+1].filter((a,i,arr)=>arr.indexOf(a)===i).sort((a,b)=>a-b).map((a)=>(<option key={a} value={a}>{a}</option>))}
                 </select>
                 <button className="ig-btn ig-btn-ghost" onClick={()=>exporterPayFitMois(moisExport.annee, moisExport.mois)} disabled={exportEnCours} title="Export des CP / demi-CP / congés sans solde du mois choisi (1er au dernier jour), au format d'import PayFit">⬇ {exportEnCours ? "Génération…" : "Export PayFit (congés)"}</button>
+                <input ref={fileImportRef} type="file" accept=".xlsx" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files[0]; if (f) analyserImportPlanning(f); e.target.value=""; }} />
+                <button className="ig-btn ig-btn-ghost" onClick={()=>fileImportRef.current && fileImportRef.current.click()} disabled={importEnCours} title="Importer un planning existant au format PLANNING N / PLANNING CUISINE N (fichier Excel)">📥 {importEnCours ? "Analyse…" : "Importer un planning (Excel)"}</button>
               </>
             )}
             {valide ? (
@@ -1619,6 +1765,30 @@ function ManagerView({ resto, onBack, superviseur }) {
               <button className="ig-btn ig-btn-primary" onClick={validerPlanning} disabled={Object.keys(planning).length===0} style={{background:'var(--sea)'}}><Icon.Check/> Valider le planning</button>
             )}
           </div>
+          {importPreview && (
+            <div className="ig-noprint ig-card" style={{padding:'16px 20px',marginBottom:14}}>
+              <div style={{fontWeight:700,marginBottom:10}}>Aperçu de l'import — {importPreview.fichierNom}</div>
+              {importPreview.liste.length === 0 ? (
+                <div className="ig-muted">Rien à importer dans ce fichier (voir le message ci-dessus).</div>
+              ) : importPreview.liste.map((item) => (
+                <div key={item.sem} style={{border:'1.5px solid var(--line)',borderRadius:12,padding:'12px 14px',marginBottom:10}}>
+                  <div style={{fontWeight:600,marginBottom:6}}>Semaine du {fmtDate(item.lundi)} au {fmtDate(ajouterJours(item.lundi,6))}</div>
+                  <div className="ig-muted" style={{marginBottom:8}}>{item.entries.length} salarié{item.entries.length>1?'s':''} reconnu{item.entries.length>1?'s':''} et prêt{item.entries.length>1?'s':''} à importer.</div>
+                  {item.nonReconnus.length > 0 && (
+                    <div style={{color:'var(--coral-d)',fontSize:13,marginBottom:8}}>⚠ Non reconnu{item.nonReconnus.length>1?'s':''} dans l'effectif de {resto} : {item.nonReconnus.join(", ")}</div>
+                  )}
+                  {item.approximatifs.length > 0 && (
+                    <div style={{color:'#9A4A1B',fontSize:13,marginBottom:8}}>≈ Reconnu{item.approximatifs.length>1?'s':''} par approximation (à vérifier) : {item.approximatifs.join(" · ")}</div>
+                  )}
+                  <div style={{display:'flex',gap:8}}>
+                    <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>setImportPreview((cur)=>cur ? {...cur, liste: cur.liste.filter((x)=>x.sem!==item.sem)} : cur)}>Ignorer cette semaine</button>
+                    <button className="ig-btn ig-btn-sm" style={{background:'var(--sea)',color:'#fff'}} disabled={item.entries.length===0} onClick={()=>confirmerImportSemaine(item)}>Confirmer l'import de cette semaine</button>
+                  </div>
+                </div>
+              ))}
+              <button className="ig-btn ig-btn-ghost ig-btn-sm" onClick={()=>setImportPreview(null)}>Fermer l'aperçu</button>
+            </div>
+          )}
           {confirmForceModele && (
             <div className="ig-noprint ig-card" style={{padding:'12px 16px',marginBottom:14,display:'flex',alignItems:'center',gap:12,flexWrap:'wrap',borderColor:'var(--coral-d)'}}>
               <b style={{color:'var(--coral-d)'}}>Forcer le modèle sur toute la semaine ?</b>
