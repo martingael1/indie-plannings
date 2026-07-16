@@ -955,6 +955,7 @@ async function chargerEffectifGlobal(restaurants) {
   const aujourdHui = new Date().toISOString().slice(0, 10);
   const rosters = await Promise.all(restaurants.map((r) => Store.get(kRoster(r))));
   const tous = [];
+  const vus = new Set(); // évite les doublons (ex: salarié présent à la fois dans le fichier et ré-ajouté dans l'appli)
   restaurants.forEach((r, i) => {
     const roster = rosters[i] || {};
     const supprimes = new Set(roster.supprimes || []);
@@ -962,9 +963,11 @@ async function chargerEffectifGlobal(restaurants) {
     const base = EMPLOYEES.filter((e) => e.r === r).concat(roster.ajouts || []);
     base.forEach((e) => {
       const id = idSalarie(e);
+      if (vus.has(id)) return;
       if (supprimes.has(id)) return;
       const fin = departs[id];
       if (fin && fin < aujourdHui) return;
+      vus.add(id);
       tous.push(e);
     });
   });
