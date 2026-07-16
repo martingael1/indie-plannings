@@ -3084,7 +3084,7 @@ export default function App() {
             <rect width="64" height="64" rx="14" fill="#111111"/>
             <text x="32" y="33" textAnchor="middle" dominantBaseline="central" fontFamily="'Inter',system-ui,sans-serif" fontWeight="800" fontSize="31" letterSpacing="-1.5" fill="#ffffff">IG</text>
           </svg>
-          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontWeight:700,fontSize:30,letterSpacing:'-.5px'}}>Indie Group</div>
+          <div style={{fontFamily:"'Inter',system-ui,sans-serif",fontWeight:700,fontSize:30,letterSpacing:'-.5px'}}>Indie Group RH</div>
         </div>
         <div className="ig-roles" style={{width:'100%',maxWidth:720,margin:0}}>
           <button className="ig-role" onClick={()=> session ? setRole('manager') : setAskCode(true)} style={{textAlign:'center'}}>
@@ -3114,7 +3114,7 @@ export default function App() {
       <div className="ig-topbar ig-noprint">
         <div className="ig-wrap">
           <button className="ig-brand" style={{background:'none',border:'none',color:'inherit',cursor:'pointer',padding:0}} onClick={reset}>
-            🌊 Indie Group
+            🌊 Indie Group RH
             <small>Plannings</small>
           </button>
           {role && (
